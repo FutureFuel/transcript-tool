@@ -173,16 +173,9 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
     if cookies_file and Path(cookies_file).is_file():
         opts.setdefault("cookiefile", cookies_file)
-    # Route ALL yt-dlp network calls through the proxy when set.
-    # Without this, the iOS player API call goes through the bare AWS IP and
-    # gets bot-checked even when the user has configured YTDLP_PROXY.
-    proxy = (
-        os.environ.get("YTDLP_PROXY")
-        or os.environ.get("HTTPS_PROXY")
-        or os.environ.get("https_proxy")
-    )
-    if proxy:
-        opts.setdefault("proxy", proxy)
+    # NOTE: proxy is intentionally NOT added here globally.
+    # It is only injected for YouTube-specific calls inside _fetch_youtube_transcript
+    # so that Dailymotion, podcast, and other non-YouTube yt-dlp calls are unaffected.
     opts.setdefault("age_limit", 99)
     opts.setdefault("extractor_args", {"youtube": {"player_client": ["ios", "web"]}})
     return opts
@@ -434,6 +427,10 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
             extractor_args={"youtube": {"player_client": ["ios"]}},
             no_warnings=True,
         )
+        # Apply proxy only for YouTube — other platforms don't need it and
+        # routing them through a datacenter proxy causes more problems than it solves.
+        if _proxy:
+            ydl_opts["proxy"] = _proxy
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(
                 f"https://www.youtube.com/watch?v={video_id}",

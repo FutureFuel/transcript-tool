@@ -6,9 +6,12 @@
 #   AWS_REGION             - AWS region of the bucket (default: us-east-1)
 #
 # Optional environment variables:
-#   YTDLP_PROXY            - Outbound proxy for YouTube requests (required on
-#                            cloud/datacenter IPs which YouTube blocks).
-#                            e.g. http://user:pass@proxy.webshare.io:8080
+#   SUPADATA_API_KEY       - API key from dash.supadata.ai (free: 100 req/mo).
+#                            Recommended: bypasses YouTube IP blocks entirely.
+#   YTDLP_PROXY            - Outbound proxy for YouTube requests. Only needed
+#                            if SUPADATA_API_KEY is not set and the server IP
+#                            is blocked. Requires a RESIDENTIAL proxy.
+#                            e.g. http://user:pass@residential-proxy:8080
 #   YTDLP_COOKIES_FILE     - Path or S3/HTTPS URL to a Netscape cookies.txt
 #                            exported from a browser logged into YouTube.
 #                            e.g. s3://your-bucket/cookies.txt

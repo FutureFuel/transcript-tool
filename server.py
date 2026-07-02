@@ -325,6 +325,52 @@ def _fetch_transcript_via_invidious(
     return None, f"All Invidious instances failed. Last: {last_error}"
 
 
+def _fetch_transcript_via_supadata(video_id: str, language: str) -> tuple[str | None, str | None]:
+    """
+    Fetch YouTube transcript via the Supadata API (https://supadata.ai).
+    Supadata runs its own infrastructure so cloud/datacenter IP blocks don't apply.
+
+    Requires env var: SUPADATA_API_KEY  (free tier: 100 req/month at dash.supadata.ai)
+
+    Returns (text, error).
+    """
+    api_key = os.environ.get("SUPADATA_API_KEY")
+    if not api_key:
+        return None, "SUPADATA_API_KEY not set"
+
+    import json as _json
+    import urllib.parse as _parse
+
+    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    params = _parse.urlencode({"url": video_url, "lang": language, "text": "true", "mode": "auto"})
+    req = urllib.request.Request(
+        f"https://api.supadata.ai/v1/transcript?{params}",
+        headers={"x-api-key": api_key, "User-Agent": "Mozilla/5.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read())
+
+        # text=true → response has a top-level "content" string
+        text = data.get("content", "")
+        if isinstance(text, str) and text.strip():
+            return text.strip(), None
+
+        # text=false fallback: join segment texts
+        segments = data.get("chunks") or data.get("segments") or []
+        if segments:
+            text = " ".join(s.get("text", "") for s in segments).strip()
+            if text:
+                return text, None
+
+        return None, f"Supadata returned empty content: {list(data.keys())}"
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")[:200]
+        return None, f"Supadata HTTP {exc.code}: {body}"
+    except Exception as exc:
+        return None, f"Supadata error: {type(exc).__name__}: {exc}"
+
+
 def _parse_json3_transcript(data: dict) -> str:
     """Parse YouTube json3 timed-text format into plain text."""
     texts: list[str] = []
@@ -351,6 +397,15 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
     Returns (text, error): text is the transcript string or None;
                            error describes why it failed (or None on success).
     """
+    # ------------------------------------------------------------------
+    # Step 0: Supadata API — zero-infrastructure solution; their servers handle
+    # YouTube IP blocks, proxies, and CAPTCHA solving.  Set SUPADATA_API_KEY
+    # (free tier: 100 req/month at dash.supadata.ai) to enable this path.
+    # ------------------------------------------------------------------
+    text, supa_error = _fetch_transcript_via_supadata(video_id, language)
+    if text:
+        return text, None
+
     # ------------------------------------------------------------------
     # Build a cookie-authenticated session used for ALL HTTP fetches below.
     # YouTube's timedtext CDN and the youtube-transcript-api both need the
@@ -1719,14 +1774,25 @@ def check_server_config() -> dict:
     except Exception:
         curl_version = "not installed"
 
+    supadata_key = os.environ.get("SUPADATA_API_KEY", "")
     return {
+        "youtube_transcript": {
+            "supadata_api_key": "set ✓" if supadata_key else "NOT SET — recommended to bypass IP blocks",
+            "proxy": os.environ.get("YTDLP_PROXY") or os.environ.get("HTTPS_PROXY") or "(not set)",
+            "note": (
+                "SUPADATA_API_KEY is the easiest fix for cloud IP blocks. "
+                "Get a free key (100 req/mo) at dash.supadata.ai"
+                if not supadata_key else
+                "Supadata API will be used as primary transcript source."
+            ),
+        },
         "cookies": {
             "env_value": cookies_raw or "(not set)",
             "resolved_path": cookies_resolved or "(not set)",
             "file_exists": cookies_ok,
             "file_size_bytes": cookies_size,
             "status": "OK — cookies will be used" if cookies_ok else
-                      "MISSING — YouTube requests will likely be IP-blocked",
+                      "MISSING — YouTube requests may be IP-blocked without SUPADATA_API_KEY",
         },
         "proxy": {
             "YTDLP_PROXY": os.environ.get("YTDLP_PROXY", "(not set)"),

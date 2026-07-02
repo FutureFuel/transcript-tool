@@ -164,7 +164,15 @@ def _resolve_ffmpeg_location() -> str | None:
 
 
 def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
-    opts = {"quiet": True, "no_warnings": True, "cachedir": False, "logger": _SilentLogger(), **options}
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "cachedir": False,
+        # Redirect any accidental file writes to /tmp so the app dir stays clean.
+        "outtmpl": "/tmp/ytdlp-%(id)s.%(ext)s",
+        "logger": _SilentLogger(),
+        **options,
+    }
     if require_ffmpeg:
         ffmpeg_location = _resolve_ffmpeg_location()
         if ffmpeg_location:
@@ -599,12 +607,9 @@ def get_video_transcript(url: str, language: str = "en") -> dict:
     yt-dlp supported source including Dailymotion (falls back to AWS Transcribe).
     Returns transcript text, title, uploader, and duration.
     """
-    ydl_opts = make_ydl_opts(
-        writesubtitles=True,
-        writeautomaticsub=True,
-        subtitleslangs=[language],
-        skip_download=True,
-    )
+    # No writesubtitles/writeautomaticsub — those cause disk writes even with
+    # skip_download=True.  Caption URLs come from the info dict instead.
+    ydl_opts = make_ydl_opts(skip_download=True)
     try:
         info = _extract_info_with_fallback(url, ydl_opts)
     except Exception as exc:
@@ -1635,14 +1640,12 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         }
 
     # --- Step 1: try native subtitles via yt-dlp (free, instant) ---
+    # Do NOT pass writesubtitles/writeautomaticsub — those cause yt-dlp to write
+    # .vtt files to disk even with skip_download=True.  We extract the caption URLs
+    # from the info dict and download them in memory ourselves (see below).
     title = uploader = duration = upload_date = None
     try:
-        ydl_opts = make_ydl_opts(
-            writesubtitles=True,
-            writeautomaticsub=True,
-            subtitleslangs=[language],
-            skip_download=True,
-        )
+        ydl_opts = make_ydl_opts(skip_download=True)
         info = _extract_info_with_fallback(url, ydl_opts)
         title = info.get("title")
         uploader = info.get("uploader")

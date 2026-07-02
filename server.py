@@ -1329,58 +1329,151 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     job_suffix = str(uuid.uuid4())[:8]
     safe_title = s3_utils._safe_key(info.get("title") or "podcast")
 
-    # Always normalise through ffmpeg when available:
-    # - HLS/DASH streams (m3u8) cannot be fetched with plain HTTP at all.
-    # - Direct audio files may have non-standard sample rates that cause
-    #   AWS Transcribe's "Invalid sample rate" error.
-    # ffmpeg's -i accepts any URL (m3u8, direct mp3/m4a, http redirect), so
-    # we use the same pipeline for everything and guarantee a clean 16 kHz
-    # mono MP3 that Transcribe always accepts.
     # _resolve_ffmpeg_location returns the full binary path (imageio-ffmpeg uses
-    # versioned names like "ffmpeg-linux64-v7.1", not just "ffmpeg").
+    # versioned names like "ffmpeg-linux-x86_64-v7.0.2", not just "ffmpeg").
     ffmpeg_bin = _resolve_ffmpeg_location() or shutil.which("ffmpeg")
+
+    def _is_hls(url: str) -> bool:
+        return "m3u8" in url or url.endswith(".m3u8")
+
+    def _resolve_hls_segments(m3u8_url: str, _depth: int = 0) -> list[str]:
+        """Parse an HLS manifest and return all media-segment URLs in order.
+        Follows one level of master-playlist redirect automatically."""
+        if _depth > 3:
+            raise ValueError("Too many levels of HLS playlist nesting")
+        req = urllib.request.Request(m3u8_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+        base = m3u8_url.rsplit("/", 1)[0] + "/"
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        # Master playlist? Follow the last (highest-quality) variant.
+        if "#EXT-X-STREAM-INF" in text:
+            variants = []
+            for i, ln in enumerate(lines):
+                if ln.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                    nxt = lines[i + 1]
+                    variants.append(nxt if nxt.startswith("http") else base + nxt)
+            if variants:
+                return _resolve_hls_segments(variants[-1], _depth + 1)
+        # Media playlist: non-comment non-empty lines are segment URLs.
+        segs = []
+        for ln in lines:
+            if not ln.startswith("#"):
+                segs.append(ln if ln.startswith("http") else base + ln)
+        return segs
+
+    def _run_ffmpeg_with_stdin(
+        ffmpeg_bin: str,
+        input_iter,           # iterable of bytes chunks
+        extra_args: list[str],
+        s3_client,
+        bucket: str,
+        s3_key: str,
+    ) -> tuple[int, str]:
+        """Stream bytes from input_iter → ffmpeg stdin → ffmpeg stdout → S3.
+        Returns (returncode, stderr_tail)."""
+        cmd = [
+            ffmpeg_bin, "-y",
+            "-f", "mpegts", "-i", "pipe:0",
+        ] + extra_args + ["pipe:1"]
+
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        stderr_chunks: list[bytes] = []
+
+        def _drain_stderr() -> None:
+            stderr_chunks.append(proc.stderr.read())
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+
+        def _write_stdin() -> None:
+            try:
+                for chunk in input_iter:
+                    proc.stdin.write(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except Exception:
+                    pass
+
+        write_thread = threading.Thread(target=_write_stdin, daemon=True)
+        write_thread.start()
+
+        try:
+            s3_client.upload_fileobj(proc.stdout, bucket, s3_key)
+        finally:
+            proc.stdout.close()
+            stderr_thread.join(timeout=30)
+            write_thread.join(timeout=300)
+            proc.wait()
+
+        return proc.returncode, b"".join(stderr_chunks).decode(errors="replace")[-600:]
+
+    _FFMPEG_AUDIO_ARGS = [
+        "-t", "7200",               # cap at 2 hours
+        "-vn",                      # drop video output
+        "-acodec", "flac",          # built-in codec — never segfaults on any hardware
+        "-ar", "16000",             # 16 kHz — AWS Transcribe standard for speech
+        "-ac", "1",                 # mono
+        "-compression_level", "0",  # fastest encode
+        "-f", "flac",
+    ]
 
     try:
         if ffmpeg_bin:
-            # FLAC: built into ffmpeg core (no external lib like libmp3lame that can
-            # segfault on certain CPUs). Lossless at 16 kHz mono → better ASR accuracy.
-            # AWS Transcribe supports FLAC natively.
             audio_ext = "flac"
             audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
             s3_client = boto3.client("s3", region_name=region)
 
-            cmd = [
-                ffmpeg_bin, "-y",
-                "-i", stream_url,
-                "-t", "7200",            # cap at 2 hours
-                "-vn",                   # strip video
-                "-acodec", "flac",       # core codec — no external lib, never segfaults
-                "-ar", "16000",          # 16 kHz — standard for speech ASR
-                "-ac", "1",              # mono
-                "-compression_level", "0",  # fastest encode; size still ~half of WAV
-                "-f", "flac",
-                "pipe:1",
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if _is_hls(stream_url):
+                # HLS: download segments in Python to bypass ffmpeg's HTTP/TLS client,
+                # which crashes (SIGSEGV) on some container environments.
+                # We pipe raw MPEG-TS bytes directly to ffmpeg stdin instead.
+                try:
+                    seg_urls = _resolve_hls_segments(stream_url)
+                    print(f"[hls] resolved {len(seg_urls)} segments — streaming via stdin", flush=True)
+                except Exception as exc:
+                    return {"error": f"Failed to parse HLS manifest: {exc}", "url": url, "step": "hls_parse"}
 
-            # Drain stderr on a background thread to prevent pipe deadlock.
-            stderr_chunks: list[bytes] = []
-            def _drain_stderr() -> None:
-                stderr_chunks.append(proc.stderr.read())
-            drain_thread = threading.Thread(target=_drain_stderr, daemon=True)
-            drain_thread.start()
+                def _seg_iter():
+                    req_hdrs = {"User-Agent": "Mozilla/5.0"}
+                    for seg_url in seg_urls:
+                        req = urllib.request.Request(seg_url, headers=req_hdrs)
+                        with urllib.request.urlopen(req, timeout=60) as r:
+                            yield r.read()
 
-            try:
-                s3_client.upload_fileobj(proc.stdout, bucket, audio_s3_key)
-            finally:
-                proc.stdout.close()
-                drain_thread.join()
-                proc.wait()
+                rc, stderr_tail = _run_ffmpeg_with_stdin(
+                    ffmpeg_bin, _seg_iter(), _FFMPEG_AUDIO_ARGS, s3_client, bucket, audio_s3_key,
+                )
+            else:
+                # Non-HLS: pass URL directly to ffmpeg (safe, no HTTP-client crash risk).
+                cmd = [ffmpeg_bin, "-y", "-i", stream_url] + _FFMPEG_AUDIO_ARGS + ["pipe:1"]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                stderr_chunks_direct: list[bytes] = []
+                def _drain_stderr_direct() -> None:
+                    stderr_chunks_direct.append(proc.stderr.read())
+                dt = threading.Thread(target=_drain_stderr_direct, daemon=True)
+                dt.start()
+                try:
+                    s3_client.upload_fileobj(proc.stdout, bucket, audio_s3_key)
+                finally:
+                    proc.stdout.close()
+                    dt.join()
+                    proc.wait()
+                rc = proc.returncode
+                stderr_tail = b"".join(stderr_chunks_direct).decode(errors="replace")[-600:]
 
-            if proc.returncode != 0:
-                stderr_text = b"".join(stderr_chunks).decode(errors="replace")[-400:]
+            if rc != 0:
                 return {
-                    "error": f"ffmpeg encode failed (exit {proc.returncode}): {stderr_text}",
+                    "error": f"ffmpeg encode failed (exit {rc}): {stderr_tail}",
                     "url": url,
                     "step": "ffmpeg_encode",
                 }

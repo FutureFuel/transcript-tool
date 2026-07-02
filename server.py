@@ -1336,17 +1336,24 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     def _is_hls(url: str) -> bool:
         return "m3u8" in url or url.endswith(".m3u8")
 
-    def _resolve_hls_segments(m3u8_url: str, _depth: int = 0) -> list[str]:
-        """Parse an HLS manifest and return all media-segment URLs in order.
-        Follows one level of master-playlist redirect automatically."""
+    def _resolve_hls_playlist(m3u8_url: str, _depth: int = 0) -> dict:
+        """Parse an HLS manifest; return {'init_url': str|None, 'segments': list[str]}.
+
+        Handles both MPEG-TS and fMP4/CMAF HLS streams:
+        - MPEG-TS streams have no #EXT-X-MAP (init_url is None).
+        - fMP4/CMAF streams declare an init segment via #EXT-X-MAP:URI="…" that
+          MUST be sent to ffmpeg before any media segments so it can read the
+          codec parameters (moov box).
+        Follows master-playlist variants automatically (picks last = highest quality).
+        """
         if _depth > 3:
             raise ValueError("Too many levels of HLS playlist nesting")
         req = urllib.request.Request(m3u8_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             text = resp.read().decode("utf-8", errors="replace")
         base = m3u8_url.rsplit("/", 1)[0] + "/"
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        # Master playlist? Follow the last (highest-quality) variant.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        # Master playlist → follow last (highest-quality) variant.
         if "#EXT-X-STREAM-INF" in text:
             variants = []
             for i, ln in enumerate(lines):
@@ -1354,13 +1361,21 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
                     nxt = lines[i + 1]
                     variants.append(nxt if nxt.startswith("http") else base + nxt)
             if variants:
-                return _resolve_hls_segments(variants[-1], _depth + 1)
-        # Media playlist: non-comment non-empty lines are segment URLs.
-        segs = []
+                return _resolve_hls_playlist(variants[-1], _depth + 1)
+        # Media playlist — find optional init segment and all media segments.
+        init_url: str | None = None
         for ln in lines:
-            if not ln.startswith("#"):
-                segs.append(ln if ln.startswith("http") else base + ln)
-        return segs
+            if ln.upper().startswith("#EXT-X-MAP:"):
+                m = re.search(r'URI="([^"]+)"', ln)
+                if m:
+                    uri = m.group(1)
+                    init_url = uri if uri.startswith("http") else base + uri
+                break
+        segs = [
+            (ln if ln.startswith("http") else base + ln)
+            for ln in lines if not ln.startswith("#") and ln
+        ]
+        return {"init_url": init_url, "segments": segs}
 
     def _run_ffmpeg_with_stdin(
         ffmpeg_bin: str,
@@ -1371,10 +1386,18 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
         s3_key: str,
     ) -> tuple[int, str]:
         """Stream bytes from input_iter → ffmpeg stdin → ffmpeg stdout → S3.
-        Returns (returncode, stderr_tail)."""
+        Returns (returncode, stderr_tail).
+
+        We do NOT specify -f here; ffmpeg auto-detects the container format
+        (MPEG-TS or fMP4) from the probed bytes.  probesize/analyzeduration are
+        increased so the PAT/PMT or fMP4 moov box is always found even in slow
+        or large-packet streams.
+        """
         cmd = [
             ffmpeg_bin, "-y",
-            "-f", "mpegts", "-i", "pipe:0",
+            "-probesize",       "10485760",   # 10 MB — enough for any PAT/PMT or moov
+            "-analyzeduration", "10000000",   # 10 s — handle late-arriving codec info
+            "-i", "pipe:0",                   # format auto-detected from probed bytes
         ] + extra_args + ["pipe:1"]
 
         proc = subprocess.Popen(
@@ -1436,15 +1459,28 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             if _is_hls(stream_url):
                 # HLS: download segments in Python to bypass ffmpeg's HTTP/TLS client,
                 # which crashes (SIGSEGV) on some container environments.
-                # We pipe raw MPEG-TS bytes directly to ffmpeg stdin instead.
+                # We pipe bytes directly to ffmpeg stdin instead.
                 try:
-                    seg_urls = _resolve_hls_segments(stream_url)
-                    print(f"[hls] resolved {len(seg_urls)} segments — streaming via stdin", flush=True)
+                    hls_info = _resolve_hls_playlist(stream_url)
+                    seg_urls = hls_info["segments"]
+                    init_url = hls_info["init_url"]
+                    stream_kind = "fMP4/CMAF" if init_url else "MPEG-TS"
+                    print(
+                        f"[hls] {stream_kind} — init={'yes' if init_url else 'no'}, "
+                        f"{len(seg_urls)} segments — streaming via stdin",
+                        flush=True,
+                    )
                 except Exception as exc:
                     return {"error": f"Failed to parse HLS manifest: {exc}", "url": url, "step": "hls_parse"}
 
                 def _seg_iter():
                     req_hdrs = {"User-Agent": "Mozilla/5.0"}
+                    # fMP4/CMAF: init segment carries the moov box (codec parameters).
+                    # It MUST arrive at ffmpeg's stdin before any media segments.
+                    if init_url:
+                        req = urllib.request.Request(init_url, headers=req_hdrs)
+                        with urllib.request.urlopen(req, timeout=30) as r:
+                            yield r.read()
                     for seg_url in seg_urls:
                         req = urllib.request.Request(seg_url, headers=req_hdrs)
                         with urllib.request.urlopen(req, timeout=60) as r:

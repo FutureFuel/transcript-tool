@@ -98,6 +98,45 @@ def _resolve_cookies_file() -> None:
 
 _resolve_cookies_file()
 
+# ---------------------------------------------------------------------------
+# Startup: clean up any stale yt-dlp temp files and check available disk space.
+# Previous failed runs may have left .part files, subtitles, or info-json files
+# in /tmp. Purge them now so the container starts with a clean slate.
+# ---------------------------------------------------------------------------
+def _startup_cleanup() -> None:
+    import glob as _glob
+
+    patterns = [
+        "/tmp/ytdlp-*",          # our own outtmpl prefix (legacy)
+        "/tmp/*.part",           # yt-dlp partial downloads
+        "/tmp/*.vtt",            # subtitle files
+        "/tmp/*.json3",          # json3 subtitle files
+        "/tmp/*.info.json",      # yt-dlp info dumps
+        "/tmp/*.description",    # yt-dlp description files
+        "/tmp/*.annotations.xml",
+        "/tmp/tmp*.mp3",
+        "/tmp/tmp*.mp4",
+        "/tmp/tmp*.m4a",
+        "/tmp/tmp*.webm",
+    ]
+    removed = 0
+    for pattern in patterns:
+        for f in _glob.glob(pattern):
+            try:
+                os.remove(f)
+                removed += 1
+            except OSError:
+                pass
+    free_mb = _disk_free_mb(Path("/tmp"))
+    if removed:
+        print(f"[startup] cleaned {removed} stale temp file(s); /tmp free: {free_mb:.0f} MB", flush=True)
+    if free_mb < 200:
+        print(f"[startup] WARNING: only {free_mb:.0f} MB free on /tmp — "
+              "audio transcription may fail with [Errno 28]", flush=True)
+
+
+_startup_cleanup()
+
 import s3_utils
 
 mcp = FastMCP("yt-dlp")
@@ -168,15 +207,16 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
-        # Disable every yt-dlp option that writes files to disk.
+        "logger": _SilentLogger(),
+        **options,
+        # These are applied AFTER **options so no caller can re-enable disk writes.
         "writesubtitles": False,
         "writeautomaticsub": False,
         "writeinfojson": False,
         "writethumbnail": False,
         "writedescription": False,
         "writeannotations": False,
-        "logger": _SilentLogger(),
-        **options,
+        "noprogress": True,
     }
     if require_ffmpeg:
         ffmpeg_location = _resolve_ffmpeg_location()

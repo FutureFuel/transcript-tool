@@ -146,6 +146,7 @@ _FFMPEG_BUILDS_URL = (
     "ffmpeg-master-latest-linux64-gpl.tar.xz"
 )
 _FFMPEG_CACHE: str | None = None
+_FFMPEG_LOCK = __import__("threading").Lock()
 
 
 def _disk_free_mb(path: Path) -> float:
@@ -160,46 +161,64 @@ def _resolve_ffmpeg_location() -> str | None:
     if _FFMPEG_CACHE is not None:
         return _FFMPEG_CACHE or None
 
-    env_location = os.environ.get("FFMPEG_LOCATION")
-    if env_location:
-        _FFMPEG_CACHE = env_location
-        return env_location
+    with _FFMPEG_LOCK:
+        # Re-check inside the lock — another thread may have resolved it.
+        if _FFMPEG_CACHE is not None:
+            return _FFMPEG_CACHE or None
 
-    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
-        _FFMPEG_CACHE = ""
-        return None
+        env_location = os.environ.get("FFMPEG_LOCATION")
+        if env_location:
+            _FFMPEG_CACHE = env_location
+            return env_location
 
-    cache_dir = Path(os.environ.get("YTDLP_FFMPEG_DIR", "/tmp/yt-dlp-ffmpeg"))
-    ffmpeg_bin = cache_dir / "ffmpeg"
-    ffprobe_bin = cache_dir / "ffprobe"
-    if ffmpeg_bin.is_file() and ffprobe_bin.is_file():
-        _FFMPEG_CACHE = str(cache_dir)
-        return _FFMPEG_CACHE
+        # Check common explicit paths first in case PATH is restricted.
+        for candidate in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"):
+            if Path(candidate).is_file():
+                _FFMPEG_CACHE = str(Path(candidate).parent)
+                return _FFMPEG_CACHE
 
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-    if system != "linux" or machine not in {"x86_64", "amd64"}:
-        _FFMPEG_CACHE = ""
-        return None
+        if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+            _FFMPEG_CACHE = ""
+            return None
 
-    if _disk_free_mb(cache_dir if cache_dir.exists() else cache_dir.parent) < 200:
-        _FFMPEG_CACHE = ""
-        return None
+        cache_dir = Path(os.environ.get("YTDLP_FFMPEG_DIR", "/tmp/yt-dlp-ffmpeg"))
+        ffmpeg_bin = cache_dir / "ffmpeg"
+        ffprobe_bin = cache_dir / "ffprobe"
+        if ffmpeg_bin.is_file() and ffprobe_bin.is_file():
+            _FFMPEG_CACHE = str(cache_dir)
+            return _FFMPEG_CACHE
 
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / "ffmpeg.tar.xz"
-        with urllib.request.urlopen(_FFMPEG_BUILDS_URL, timeout=120) as response:
-            archive.write_bytes(response.read())
-        with tarfile.open(archive, "r:xz") as tar:
-            tar.extractall(tmp, filter="data")
-        build_root = next(Path(tmp).glob("ffmpeg-*-linux64-gpl"))
-        for name, dest in (("ffmpeg", ffmpeg_bin), ("ffprobe", ffprobe_bin)):
-            shutil.copy2(build_root / "bin" / name, dest)
-            dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        system = platform.system().lower()
+        machine = platform.machine().lower()
+        if system != "linux" or machine not in {"x86_64", "amd64"}:
+            _FFMPEG_CACHE = ""
+            return None
 
-    _FFMPEG_CACHE = str(cache_dir)
-    return _FFMPEG_CACHE
+        free_mb = _disk_free_mb(cache_dir if cache_dir.exists() else cache_dir.parent)
+        if free_mb < 300:
+            print(f"[ffmpeg] only {free_mb:.0f} MB free — skipping download to avoid ENOSPC", flush=True)
+            _FFMPEG_CACHE = ""
+            return None
+
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory() as tmp:
+                archive = Path(tmp) / "ffmpeg.tar.xz"
+                with urllib.request.urlopen(_FFMPEG_BUILDS_URL, timeout=120) as response:
+                    archive.write_bytes(response.read())
+                with tarfile.open(archive, "r:xz") as tar:
+                    tar.extractall(tmp, filter="data")
+                build_root = next(Path(tmp).glob("ffmpeg-*-linux64-gpl"))
+                for name, dest in (("ffmpeg", ffmpeg_bin), ("ffprobe", ffprobe_bin)):
+                    shutil.copy2(build_root / "bin" / name, dest)
+                    dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            _FFMPEG_CACHE = str(cache_dir)
+            return _FFMPEG_CACHE
+        except Exception as exc:
+            # Mark as resolved-but-unavailable so we never retry and never fill /tmp again.
+            print(f"[ffmpeg] download failed ({exc}) — audio transcription will be unavailable", flush=True)
+            _FFMPEG_CACHE = ""
+            return None
 
 
 def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:

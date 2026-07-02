@@ -51,6 +51,7 @@ dependencies = [
     "langgraph>=0.2",
     "boto3>=1.26",
     "youtube-transcript-api>=0.6",
+    "imageio-ffmpeg>=0.4",
 ]
 
 [project.optional-dependencies]

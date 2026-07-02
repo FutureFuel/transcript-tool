@@ -172,7 +172,19 @@ def _resolve_ffmpeg_location() -> str | None:
             _FFMPEG_CACHE = env_location
             return env_location
 
-        # Check common explicit paths first in case PATH is restricted.
+        # imageio-ffmpeg ships a bundled ffmpeg binary — try it first so we
+        # never need a system install or a GitHub download on managed hosts.
+        try:
+            import imageio_ffmpeg as _iio_ffmpeg
+            _iio_bin = _iio_ffmpeg.get_ffmpeg_exe()
+            if _iio_bin and Path(_iio_bin).is_file():
+                _FFMPEG_CACHE = str(Path(_iio_bin).parent)
+                print(f"[ffmpeg] using imageio-ffmpeg binary: {_iio_bin}", flush=True)
+                return _FFMPEG_CACHE
+        except Exception:
+            pass
+
+        # Check common explicit paths in case PATH is restricted.
         for candidate in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"):
             if Path(candidate).is_file():
                 _FFMPEG_CACHE = str(Path(candidate).parent)

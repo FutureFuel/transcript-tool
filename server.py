@@ -168,8 +168,13 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
         "quiet": True,
         "no_warnings": True,
         "cachedir": False,
-        # Redirect any accidental file writes to /tmp so the app dir stays clean.
-        "outtmpl": "/tmp/ytdlp-%(id)s.%(ext)s",
+        # Disable every yt-dlp option that writes files to disk.
+        "writesubtitles": False,
+        "writeautomaticsub": False,
+        "writeinfojson": False,
+        "writethumbnail": False,
+        "writedescription": False,
+        "writeannotations": False,
         "logger": _SilentLogger(),
         **options,
     }
@@ -714,41 +719,25 @@ def get_podcast_stream_url(url: str) -> dict:
 @mcp.tool()
 def get_podcast_transcript(url: str, audio_format: str = "mp3") -> dict:
     """
-    Extract audio from a podcast episode, upload it directly to S3,
-    and return the S3 location for downstream transcription.
-    No audio content is retained on local disk after the upload completes.
+    Extract audio from a podcast episode, stream it directly to S3 via ffmpeg
+    (zero local disk usage), and return the S3 location for downstream transcription.
     Requires the S3_BUCKET environment variable and AWS credentials.
     Returns s3_uri, s3_download_url, and episode metadata.
     """
-    output_dir = tempfile.mkdtemp()
-    ydl_opts = make_ydl_opts(
-        require_ffmpeg=True,
-        format="bestaudio/best",
-        outtmpl=os.path.join(output_dir, "%(title)s.%(ext)s"),
-        restrictfilenames=True,
-        postprocessors=[{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": audio_format,
-        }],
-    )
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-
-    s3 = s3_utils.upload_audio_and_cleanup(
-        output_dir=output_dir,
-        title=info.get("title") or "",
-        audio_format=audio_format,
-    )
-
+    # Delegate entirely to start_podcast_transcription which already uses the
+    # zero-disk ffmpeg→pipe→S3 pipeline.
+    result = start_podcast_transcription(url)
+    if result.get("error"):
+        return result
     return {
-        "title": info.get("title"),
-        "uploader": info.get("uploader"),
-        "duration_seconds": info.get("duration"),
-        "upload_date": info.get("upload_date"),
-        "description": (info.get("description") or "")[:500],
-        "s3_uri": s3["s3_uri"],
-        "s3_download_url": s3["s3_download_url"],
-        "s3_key": s3["s3_key"],
+        "title": result.get("title"),
+        "uploader": result.get("uploader"),
+        "duration_seconds": result.get("duration_seconds"),
+        "upload_date": result.get("upload_date"),
+        "s3_uri": f"s3://{s3_utils.bucket_name()}/{result.get('transcript_s3_key', '')}",
+        "s3_download_url": s3_utils.presigned_download_url(result.get("transcript_s3_key", "")),
+        "s3_key": result.get("transcript_s3_key"),
+        "job_name": result.get("job_name"),
         "url": url,
     }
 
@@ -946,12 +935,7 @@ def extract_timestamped_segments(
     """
     import json
 
-    ydl_opts = make_ydl_opts(
-        writesubtitles=True,
-        writeautomaticsub=True,
-        subtitleslangs=[language],
-        skip_download=True,
-    )
+    ydl_opts = make_ydl_opts(skip_download=True)
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
         title = info.get("title")

@@ -1342,20 +1342,23 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
 
     try:
         if ffmpeg_bin:
-            audio_ext = "mp3"
+            # FLAC: built into ffmpeg core (no external lib like libmp3lame that can
+            # segfault on certain CPUs). Lossless at 16 kHz mono → better ASR accuracy.
+            # AWS Transcribe supports FLAC natively.
+            audio_ext = "flac"
             audio_s3_key = f"podcast-audio/{safe_title}-{job_suffix}.{audio_ext}"
             s3_client = boto3.client("s3", region_name=region)
 
             cmd = [
                 ffmpeg_bin, "-y",
                 "-i", stream_url,
-                "-t", "7200",            # cap at 2 hours — prevents disk fill on runaway streams
+                "-t", "7200",            # cap at 2 hours
                 "-vn",                   # strip video
-                "-acodec", "libmp3lame",
+                "-acodec", "flac",       # core codec — no external lib, never segfaults
                 "-ar", "16000",          # 16 kHz — standard for speech ASR
-                "-ac", "1",              # mono — halves size, fine for speech
-                "-q:a", "4",             # VBR ~165 kbps
-                "-f", "mp3",             # MP3 is fully streamable (no seeking needed)
+                "-ac", "1",              # mono
+                "-compression_level", "0",  # fastest encode; size still ~half of WAV
+                "-f", "flac",
                 "pipe:1",
             ]
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -1429,7 +1432,7 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
         # When ffmpeg normalised the audio we know the exact output sample rate,
         # so we pass it explicitly — this prevents Transcribe's auto-detection
         # from failing on unusual source rates.
-        if ffmpeg_bin and audio_ext == "mp3":
+        if ffmpeg_bin and audio_ext in ("mp3", "flac", "wav"):
             transcribe_kwargs["MediaSampleRateHertz"] = 16000
         transcribe.start_transcription_job(**transcribe_kwargs)
     except Exception as exc:

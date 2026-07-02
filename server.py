@@ -1522,7 +1522,8 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
 
     Non-YouTube strategy (Dailymotion, podcasts, direct URLs, etc.):
       1. S3 cache (instant, free)
-      2. AWS Transcribe — streams audio via ffmpeg to S3, transcribes
+      2. yt-dlp native subtitles (free, instant when available)
+      3. AWS Transcribe — streams audio via ffmpeg to S3, transcribes
          (may take 2-5 minutes; no Supadata used for non-YouTube sources)
 
     Returns: transcript_text, url, language, transcript_source, char_count,
@@ -1618,11 +1619,11 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         }
 
     # ------------------------------------------------------------------
-    # Non-YouTube: S3 cache → AWS Transcribe only.
-    # Supadata is YouTube-specific; yt-dlp subtitle extraction is skipped
-    # to keep the path simple and avoid unnecessary bot-check attempts.
+    # Non-YouTube: S3 cache → yt-dlp native subtitles → AWS Transcribe
+    # Supadata is YouTube-specific and is never used here.
     # ------------------------------------------------------------------
     import hashlib as _hashlib
+    import re as _re
     url_hash = _hashlib.sha1(url.encode()).hexdigest()[:16]
     cache_id = f"url_{url_hash}_{language}"
     cached = _load_cache(cache_id)
@@ -1636,12 +1637,73 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
             "char_count": len(cached),
         }
 
+    # --- Step 1: try native subtitles via yt-dlp (free, instant) ---
+    title = uploader = duration = upload_date = None
+    try:
+        ydl_opts = make_ydl_opts(
+            writesubtitles=True,
+            writeautomaticsub=True,
+            subtitleslangs=[language],
+            skip_download=True,
+        )
+        info = _extract_info_with_fallback(url, ydl_opts)
+        title = info.get("title")
+        uploader = info.get("uploader")
+        duration = info.get("duration")
+        upload_date = info.get("upload_date")
+
+        subtitles = info.get("subtitles", {}) or {}
+        auto_caps = info.get("automatic_captions", {}) or {}
+        all_subs = subtitles if language in subtitles else auto_caps
+        caption_url = caption_ext = None
+        for fmt in all_subs.get(language, []):
+            if fmt.get("ext") in ("json3", "vtt", "srv3"):
+                caption_url = fmt.get("url")
+                caption_ext = fmt.get("ext")
+                break
+
+        if caption_url:
+            with urllib.request.urlopen(caption_url, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+
+            if caption_ext == "json3":
+                data = json.loads(raw)
+                parts = [
+                    "".join(s.get("utf8", "") for s in ev.get("segs", [])).strip()
+                    for ev in data.get("events", [])
+                ]
+                transcript_text = " ".join(p for p in parts if p and p != "\n")
+            else:
+                lines = []
+                for line in raw.splitlines():
+                    line = line.strip()
+                    if not line or "-->" in line or line.isdigit():
+                        continue
+                    line = _re.sub(r"<[^>]+>", "", line)
+                    if line:
+                        lines.append(line)
+                transcript_text = " ".join(lines)
+
+            if transcript_text:
+                _save_cache(cache_id, transcript_text, f"native_captions {url[:60]}")
+                return {
+                    "title": title, "uploader": uploader,
+                    "duration_seconds": duration, "upload_date": upload_date,
+                    "url": url, "language": language,
+                    "transcript_text": transcript_text,
+                    "transcript_source": "native_captions",
+                    "char_count": len(transcript_text),
+                }
+    except Exception:
+        pass  # no subtitles or extraction failed — fall through to AWS Transcribe
+
+    # --- Step 2: no native subtitles → AWS Transcribe ---
     language_code = language_code_map.get(language, f"{language}-{language.upper()}")
     job = start_podcast_transcription(url, language_code=language_code)
 
     if job.get("error"):
         return {
-            "url": url,
+            "title": title, "uploader": uploader, "url": url,
             "transcript_text": None,
             "error": job["error"],
             "transcript_source": "failed",
@@ -1649,7 +1711,6 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
 
     job_name = job.get("job_name")
 
-    # Poll until complete (max ~8 minutes, suitable for videos up to ~60 min)
     for _ in range(48):
         time.sleep(10)
         result = get_transcription_result(job_name)
@@ -1659,22 +1720,23 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
             if transcript:
                 _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}")
             return {
-                "url": url,
-                "language": language,
+                "title": title, "uploader": uploader,
+                "duration_seconds": duration, "upload_date": upload_date,
+                "url": url, "language": language,
                 "transcript_text": transcript,
                 "transcript_source": "aws_transcribe",
                 "char_count": len(transcript),
             }
         if status == "FAILED":
             return {
-                "url": url,
+                "title": title, "uploader": uploader, "url": url,
                 "transcript_text": None,
                 "error": result.get("error", "AWS Transcribe job failed"),
                 "transcript_source": "failed",
             }
 
     return {
-        "url": url,
+        "title": title, "uploader": uploader, "url": url,
         "transcript_text": None,
         "transcript_source": "timeout",
         "job_name": job_name,

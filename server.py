@@ -1634,11 +1634,17 @@ def get_transcription_result(job_name: str) -> dict:
     except Exception as exc:
         return {"error": f"Job completed but failed to fetch transcript: {exc}", "job_name": job_name}
 
+    # Save a plain-text copy under transcripts/{job_name}_text.txt so users can
+    # retrieve it directly from S3 without re-parsing the Transcribe JSON.
+    text_s3_key = f"transcripts/{job_name}_text.txt"
+    s3_utils.put_transcript(f"{job_name}_text", transcript_text)
+
     return {
         "status": "COMPLETED",
         "job_name": job_name,
         "transcript": transcript_text,
         "transcript_s3_key": transcript_s3_key,
+        "transcript_text_s3_key": text_s3_key,
     }
 
 
@@ -1745,12 +1751,16 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         except Exception:
             return None
 
-    def _save_cache(identifier: str, text: str, source: str) -> None:
+    def _save_cache(identifier: str, text: str, source: str) -> str | None:
+        """Save transcript to S3 and return the S3 key, or None on error."""
         try:
-            s3_utils.put_transcript(_cache_key_for(identifier), text)
-            print(f"[transcript-cache] saved {source} → transcripts/{_cache_key_for(identifier)}.txt", flush=True)
+            key = _cache_key_for(identifier)
+            s3_utils.put_transcript(key, text)
+            s3_key = f"transcripts/{key}.txt"
+            print(f"[transcript-cache] saved {source} → {s3_key}", flush=True)
+            return s3_key
         except Exception:
-            pass
+            return None
 
     # --- Fast path: YouTube-direct transcript (no yt-dlp, no bot check) ---
     yt_id = _youtube_video_id(url)
@@ -1775,7 +1785,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
 
         text, transcript_error = _fetch_youtube_transcript(yt_id, language)
         if text:
-            _save_cache(cache_id, text, f"youtube/{yt_id}/{language}")
+            s3_key = _save_cache(cache_id, text, f"youtube/{yt_id}/{language}")
             meta = _youtube_oembed_meta(yt_id)
             return {
                 "title": meta.get("title"),
@@ -1786,6 +1796,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 "language": language,
                 "transcript_text": text,
                 "transcript_source": "youtube_transcript_api",
+                "transcript_s3_key": s3_key,
                 "char_count": len(text),
             }
 
@@ -1878,13 +1889,14 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 transcript_text = " ".join(lines)
 
             if transcript_text:
-                _save_cache(cache_id, transcript_text, f"native_captions {url[:60]}")
+                s3_key = _save_cache(cache_id, transcript_text, f"native_captions {url[:60]}")
                 return {
                     "title": title, "uploader": uploader,
                     "duration_seconds": duration, "upload_date": upload_date,
                     "url": url, "language": language,
                     "transcript_text": transcript_text,
                     "transcript_source": "native_captions",
+                    "transcript_s3_key": s3_key,
                     "char_count": len(transcript_text),
                 }
     except Exception:
@@ -1910,14 +1922,14 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         status = result.get("status")
         if status == "COMPLETED":
             transcript = result.get("transcript") or ""
-            if transcript:
-                _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}")
+            s3_key = _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}") if transcript else None
             return {
                 "title": title, "uploader": uploader,
                 "duration_seconds": duration, "upload_date": upload_date,
                 "url": url, "language": language,
                 "transcript_text": transcript,
                 "transcript_source": "aws_transcribe",
+                "transcript_s3_key": s3_key or result.get("transcript_text_s3_key"),
                 "char_count": len(transcript),
             }
         if status == "FAILED":

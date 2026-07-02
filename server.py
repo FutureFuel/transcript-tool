@@ -174,11 +174,13 @@ def _resolve_ffmpeg_location() -> str | None:
 
         # imageio-ffmpeg ships a bundled ffmpeg binary — try it first so we
         # never need a system install or a GitHub download on managed hosts.
+        # NOTE: its binary is named e.g. "ffmpeg-linux64-v7.1", not just "ffmpeg",
+        # so we store the FULL PATH to the executable, not the directory.
         try:
             import imageio_ffmpeg as _iio_ffmpeg
             _iio_bin = _iio_ffmpeg.get_ffmpeg_exe()
             if _iio_bin and Path(_iio_bin).is_file():
-                _FFMPEG_CACHE = str(Path(_iio_bin).parent)
+                _FFMPEG_CACHE = str(_iio_bin)
                 print(f"[ffmpeg] using imageio-ffmpeg binary: {_iio_bin}", flush=True)
                 return _FFMPEG_CACHE
         except Exception:
@@ -187,18 +189,19 @@ def _resolve_ffmpeg_location() -> str | None:
         # Check common explicit paths in case PATH is restricted.
         for candidate in ("/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"):
             if Path(candidate).is_file():
-                _FFMPEG_CACHE = str(Path(candidate).parent)
+                _FFMPEG_CACHE = candidate
                 return _FFMPEG_CACHE
 
-        if shutil.which("ffmpeg") and shutil.which("ffprobe"):
-            _FFMPEG_CACHE = ""
-            return None
+        found = shutil.which("ffmpeg")
+        if found and shutil.which("ffprobe"):
+            _FFMPEG_CACHE = found
+            return _FFMPEG_CACHE
 
         cache_dir = Path(os.environ.get("YTDLP_FFMPEG_DIR", "/tmp/yt-dlp-ffmpeg"))
         ffmpeg_bin = cache_dir / "ffmpeg"
         ffprobe_bin = cache_dir / "ffprobe"
         if ffmpeg_bin.is_file() and ffprobe_bin.is_file():
-            _FFMPEG_CACHE = str(cache_dir)
+            _FFMPEG_CACHE = str(ffmpeg_bin)
             return _FFMPEG_CACHE
 
         system = platform.system().lower()
@@ -225,7 +228,7 @@ def _resolve_ffmpeg_location() -> str | None:
                 for name, dest in (("ffmpeg", ffmpeg_bin), ("ffprobe", ffprobe_bin)):
                     shutil.copy2(build_root / "bin" / name, dest)
                     dest.chmod(dest.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-            _FFMPEG_CACHE = str(cache_dir)
+            _FFMPEG_CACHE = str(ffmpeg_bin)
             return _FFMPEG_CACHE
         except Exception as exc:
             # Mark as resolved-but-unavailable so we never retry and never fill /tmp again.
@@ -251,9 +254,10 @@ def make_ydl_opts(*, require_ffmpeg: bool = False, **options) -> dict:
         "noprogress": True,
     }
     if require_ffmpeg:
-        ffmpeg_location = _resolve_ffmpeg_location()
-        if ffmpeg_location:
-            opts.setdefault("ffmpeg_location", ffmpeg_location)
+        ffmpeg_bin_path = _resolve_ffmpeg_location()
+        if ffmpeg_bin_path:
+            # yt-dlp expects the directory containing the binary, not the binary itself.
+            opts.setdefault("ffmpeg_location", str(Path(ffmpeg_bin_path).parent))
     # Support a Netscape-format cookies file for age-restricted / auth-gated videos.
     cookies_file = os.environ.get("YTDLP_COOKIES_FILE")
     if cookies_file and Path(cookies_file).is_file():
@@ -1332,8 +1336,9 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     # ffmpeg's -i accepts any URL (m3u8, direct mp3/m4a, http redirect), so
     # we use the same pipeline for everything and guarantee a clean 16 kHz
     # mono MP3 that Transcribe always accepts.
-    ffmpeg_loc = _resolve_ffmpeg_location()
-    ffmpeg_bin = os.path.join(ffmpeg_loc, "ffmpeg") if ffmpeg_loc else shutil.which("ffmpeg")
+    # _resolve_ffmpeg_location returns the full binary path (imageio-ffmpeg uses
+    # versioned names like "ffmpeg-linux64-v7.1", not just "ffmpeg").
+    ffmpeg_bin = _resolve_ffmpeg_location() or shutil.which("ffmpeg")
 
     try:
         if ffmpeg_bin:
@@ -1812,8 +1817,7 @@ def check_server_config() -> dict:
     cookies_ok = bool(cookies_resolved and Path(cookies_resolved).is_file())
     cookies_size = Path(cookies_resolved).stat().st_size if cookies_ok else None
 
-    ffmpeg_loc = _resolve_ffmpeg_location()
-    ffmpeg_bin = os.path.join(ffmpeg_loc, "ffmpeg") if ffmpeg_loc else shutil.which("ffmpeg")
+    ffmpeg_bin = _resolve_ffmpeg_location() or shutil.which("ffmpeg")
 
     try:
         yt_api_version = __import__("youtube_transcript_api").__version__

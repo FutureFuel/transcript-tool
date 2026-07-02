@@ -1521,18 +1521,55 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     import json
     import time
 
-    # --- Step 1: Try native captions first (fast, zero download) ---
     language_code_map = {
         "en": "en-US", "fr": "fr-FR", "de": "de-DE", "es": "es-ES",
         "it": "it-IT", "pt": "pt-BR", "nl": "nl-NL", "ja": "ja-JP",
         "ko": "ko-KR", "zh": "zh-CN",
     }
 
+    # --- S3 cache helpers (silently skip if S3_BUCKET not configured) ---
+    def _cache_key_for(identifier: str) -> str:
+        """Normalise identifier into a safe S3 key segment."""
+        import re as _re
+        return _re.sub(r"[^\w\-]", "_", identifier)[:200]
+
+    def _load_cache(identifier: str) -> str | None:
+        try:
+            return s3_utils.get_transcript(_cache_key_for(identifier))
+        except Exception:
+            return None
+
+    def _save_cache(identifier: str, text: str, source: str) -> None:
+        try:
+            s3_utils.put_transcript(_cache_key_for(identifier), text)
+            print(f"[transcript-cache] saved {source} → transcripts/{_cache_key_for(identifier)}.txt", flush=True)
+        except Exception:
+            pass
+
     # --- Fast path: YouTube-direct transcript (no yt-dlp, no bot check) ---
     yt_id = _youtube_video_id(url)
     if yt_id:
+        # Check S3 cache first — avoids burning Supadata credits on re-fetches
+        cache_id = f"youtube_{yt_id}_{language}"
+        cached = _load_cache(cache_id)
+        if cached:
+            meta = _youtube_oembed_meta(yt_id)
+            print(f"[transcript-cache] hit youtube/{yt_id}/{language}", flush=True)
+            return {
+                "title": meta.get("title"),
+                "uploader": meta.get("uploader"),
+                "duration_seconds": meta.get("duration_seconds"),
+                "upload_date": meta.get("upload_date"),
+                "url": url,
+                "language": language,
+                "transcript_text": cached,
+                "transcript_source": "s3_cache",
+                "char_count": len(cached),
+            }
+
         text, transcript_error = _fetch_youtube_transcript(yt_id, language)
         if text:
+            _save_cache(cache_id, text, f"youtube/{yt_id}/{language}")
             meta = _youtube_oembed_meta(yt_id)
             return {
                 "title": meta.get("title"),
@@ -1579,13 +1616,16 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
             time.sleep(10)
             result = get_transcription_result(job_name)
             if result.get("status") == "COMPLETED":
+                transcript = result.get("transcript") or ""
+                if transcript:
+                    _save_cache(cache_id, transcript, f"aws_transcribe youtube/{yt_id}")
                 return {
                     **meta,
                     "url": url,
                     "language": language,
-                    "transcript_text": result.get("transcript"),
+                    "transcript_text": transcript,
                     "transcript_source": "aws_transcribe",
-                    "char_count": len(result.get("transcript") or ""),
+                    "char_count": len(transcript),
                 }
             if result.get("status") == "FAILED":
                 return {
@@ -1687,6 +1727,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                         lines.append(line)
                 transcript_text = " ".join(lines)
 
+            _save_cache(cache_id, transcript_text, f"native_captions {url[:60]}")
             return {
                 "title": title,
                 "uploader": uploader,
@@ -1702,6 +1743,21 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
             pass  # caption fetch failed — fall through to audio transcription
 
     # --- Step 2: No captions — stream audio to S3 and transcribe ---
+    # Cache key for non-YouTube URLs: hash of normalized URL + language
+    import hashlib as _hashlib
+    url_hash = _hashlib.sha1(url.encode()).hexdigest()[:16]
+    cache_id = f"url_{url_hash}_{language}"
+    cached = _load_cache(cache_id)
+    if cached:
+        print(f"[transcript-cache] hit url/{url_hash}/{language}", flush=True)
+        return {
+            "title": title, "uploader": uploader, "url": url,
+            "language": language,
+            "transcript_text": cached,
+            "transcript_source": "s3_cache",
+            "char_count": len(cached),
+        }
+
     language_code = language_code_map.get(language, f"{language}-{language.upper()}")
     job = start_podcast_transcription(url, language_code=language_code)
 
@@ -1721,6 +1777,9 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         result = get_transcription_result(job_name)
         status = result.get("status")
         if status == "COMPLETED":
+            transcript = result.get("transcript") or ""
+            if transcript:
+                _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}")
             return {
                 "title": title,
                 "uploader": uploader,
@@ -1728,9 +1787,9 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 "upload_date": upload_date,
                 "url": url,
                 "language": language,
-                "transcript_text": result.get("transcript"),
+                "transcript_text": transcript,
                 "transcript_source": "aws_transcribe",
-                "char_count": len(result.get("transcript") or ""),
+                "char_count": len(transcript),
             }
         if status == "FAILED":
             return {

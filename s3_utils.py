@@ -84,6 +84,41 @@ def presigned_download_url(s3_key: str, expiration_seconds: int = 86400) -> str 
         return None
 
 
+def get_transcript(cache_key: str) -> str | None:
+    """
+    Return cached transcript text for *cache_key*, or None if not cached.
+    Keys are stored under ``transcripts/<cache_key>.txt`` in the S3 bucket.
+    Silently returns None on any error (missing key, permission, etc.).
+    """
+    s3_key = f"transcripts/{cache_key}.txt"
+    try:
+        obj = _client().get_object(Bucket=bucket_name(), Key=s3_key)
+        return obj["Body"].read().decode("utf-8")
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def put_transcript(cache_key: str, text: str) -> None:
+    """
+    Save *text* as ``transcripts/<cache_key>.txt`` in the S3 bucket.
+    Silently swallows errors so transcript delivery is never blocked by caching.
+    """
+    s3_key = f"transcripts/{cache_key}.txt"
+    try:
+        _client().put_object(
+            Bucket=bucket_name(),
+            Key=s3_key,
+            Body=text.encode("utf-8"),
+            ContentType="text/plain; charset=utf-8",
+        )
+    except Exception:
+        pass
+
+
 def upload_audio_and_cleanup(output_dir: str | Path, title: str, audio_format: str) -> dict:
     """
     Find the converted audio file inside *output_dir*, upload it to S3,

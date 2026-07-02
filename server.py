@@ -98,6 +98,21 @@ def _resolve_cookies_file() -> None:
 
 _resolve_cookies_file()
 
+_FFMPEG_BUILDS_URL = (
+    "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/"
+    "ffmpeg-master-latest-linux64-gpl.tar.xz"
+)
+_FFMPEG_CACHE: str | None = None
+_FFMPEG_LOCK = __import__("threading").Lock()
+
+
+def _disk_free_mb(path: Path) -> float:
+    try:
+        return shutil.disk_usage(path).free / (1024 * 1024)
+    except OSError:
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Startup: clean up any stale yt-dlp temp files and check available disk space.
 # Previous failed runs may have left .part files, subtitles, or info-json files
@@ -140,20 +155,6 @@ _startup_cleanup()
 import s3_utils
 
 mcp = FastMCP("yt-dlp")
-
-_FFMPEG_BUILDS_URL = (
-    "https://github.com/yt-dlp/FFmpeg-Builds/releases/latest/download/"
-    "ffmpeg-master-latest-linux64-gpl.tar.xz"
-)
-_FFMPEG_CACHE: str | None = None
-_FFMPEG_LOCK = __import__("threading").Lock()
-
-
-def _disk_free_mb(path: Path) -> float:
-    try:
-        return shutil.disk_usage(path).free / (1024 * 1024)
-    except OSError:
-        return 0.0
 
 
 def _resolve_ffmpeg_location() -> str | None:

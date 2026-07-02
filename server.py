@@ -384,28 +384,18 @@ def _parse_json3_transcript(data: dict) -> str:
 
 def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None, str | None]:
     """
-    Fetch YouTube transcript using yt-dlp iOS client + direct timedtext API.
+    Fetch YouTube transcript, trying every free method before spending API credits.
 
-    Strategy (each step tried in order):
-    1. yt-dlp with iOS player client + process=False → extracts timedtext URLs
-       without triggering bot-check or needing PO tokens; fetches the json3
-       timed-text file directly — works from cloud/datacenter IPs.
-    2. Invidious public API (multiple instances) — fallback when yt-dlp fails.
-    3. youtube-transcript-api with cookie-authenticated requests.Session —
-       last resort; requires YTDLP_COOKIES_FILE and non-blocked IP.
+    Order (cheapest / most reliable first):
+    1. yt-dlp iOS client + direct timedtext fetch  — free, no rate limit
+    2. Invidious public API                         — free, no rate limit
+    3. youtube-transcript-api (cookie session)      — free, may be IP-blocked
+    4. Supadata API (LAST RESORT)                   — 100 free req/month;
+       only used when all three free methods fail.
+       Set SUPADATA_API_KEY to enable (dash.supadata.ai).
 
-    Returns (text, error): text is the transcript string or None;
-                           error describes why it failed (or None on success).
+    Returns (text, error).
     """
-    # ------------------------------------------------------------------
-    # Step 0: Supadata API — zero-infrastructure solution; their servers handle
-    # YouTube IP blocks, proxies, and CAPTCHA solving.  Set SUPADATA_API_KEY
-    # (free tier: 100 req/month at dash.supadata.ai) to enable this path.
-    # ------------------------------------------------------------------
-    text, supa_error = _fetch_transcript_via_supadata(video_id, language)
-    if text:
-        return text, None
-
     # ------------------------------------------------------------------
     # Build a cookie-authenticated session used for ALL HTTP fetches below.
     # YouTube's timedtext CDN and the youtube-transcript-api both need the
@@ -553,16 +543,31 @@ def _fetch_youtube_transcript(video_id: str, language: str) -> tuple[str | None,
                     )
         return None, "No transcript found"
     except (RequestBlocked, IpBlocked) as exc:
-        return None, (
-            f"All methods blocked. yt-dlp: {ytdlp_error}; Invidious: {inv_error}; "
-            f"API: {type(exc).__name__}. Set YTDLP_PROXY=http://your-proxy:port."
-        )
+        api_error = f"{type(exc).__name__}"
     except TranscriptsDisabled:
         return None, "Transcripts are disabled for this video"
     except VideoUnavailable:
         return None, "Video is unavailable"
     except Exception as exc:
-        return None, f"Transcript fetch error: {type(exc).__name__}: {exc}"
+        api_error = f"{type(exc).__name__}: {exc}"
+    else:
+        api_error = "no transcript found"
+
+    # ------------------------------------------------------------------
+    # Step 4: Supadata API — last resort; spends from the monthly quota.
+    # Only reached when all three free methods above have failed.
+    # ------------------------------------------------------------------
+    text, supa_error = _fetch_transcript_via_supadata(video_id, language)
+    if text:
+        return text, None
+
+    return None, (
+        f"All methods failed. "
+        f"yt-dlp: {ytdlp_error}; "
+        f"Invidious: {inv_error}; "
+        f"youtube-transcript-api: {api_error}; "
+        f"Supadata: {supa_error}"
+    )
 
 
 def _extract_info_with_fallback(url: str, ydl_opts: dict) -> dict:
@@ -1507,16 +1512,21 @@ def normalize_youtube_url(url: str) -> dict:
 def get_transcript_text(url: str, language: str = "en") -> dict:
     """
     Get the full transcript text for any video or audio URL in a single call.
-    No video is ever downloaded to disk.
 
-    Strategy by source type:
-    - YouTube / any source with native captions: fetches the caption file directly
-      (no download, just an HTTP request for the subtitle URL).
-    - Dailymotion, Vimeo, and other sources without captions: streams audio via
-      ffmpeg directly to S3, starts an AWS Transcribe job, and polls until done
-      (may take 2-5 minutes for longer videos).
+    YouTube strategy (free methods first, paid last):
+      1. S3 cache (instant, free)
+      2. yt-dlp iOS client + YouTube timedtext API (free)
+      3. Invidious public API (free)
+      4. youtube-transcript-api with cookie session (free)
+      5. Supadata API (last resort — set SUPADATA_API_KEY; 100 free req/month)
 
-    Returns: transcript_text, title, uploader, duration_seconds, source, language.
+    Non-YouTube strategy (Dailymotion, podcasts, direct URLs, etc.):
+      1. S3 cache (instant, free)
+      2. AWS Transcribe — streams audio via ffmpeg to S3, transcribes
+         (may take 2-5 minutes; no Supadata used for non-YouTube sources)
+
+    Returns: transcript_text, url, language, transcript_source, char_count,
+             and for YouTube: title, uploader, duration_seconds, upload_date.
     """
     import json
     import time
@@ -1597,153 +1607,21 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 ),
             }
 
-        # No captions on this YouTube video — go straight to audio transcription.
-        # Do NOT call yt-dlp for metadata here; that triggers the bot check.
-        language_code = language_code_map.get(language, f"{language}-{language.upper()}")
-        job = start_podcast_transcription(url, language_code=language_code)
+        # All free methods + Supadata failed — surface the error clearly.
         meta = _youtube_oembed_meta(yt_id)
-        if job.get("error"):
-            return {
-                **meta,
-                "url": url,
-                "transcript_text": None,
-                "error": job["error"],
-                "transcript_source": "failed",
-                "transcript_error": transcript_error,
-            }
-        job_name = job.get("job_name")
-        for _ in range(48):
-            time.sleep(10)
-            result = get_transcription_result(job_name)
-            if result.get("status") == "COMPLETED":
-                transcript = result.get("transcript") or ""
-                if transcript:
-                    _save_cache(cache_id, transcript, f"aws_transcribe youtube/{yt_id}")
-                return {
-                    **meta,
-                    "url": url,
-                    "language": language,
-                    "transcript_text": transcript,
-                    "transcript_source": "aws_transcribe",
-                    "char_count": len(transcript),
-                }
-            if result.get("status") == "FAILED":
-                return {
-                    **meta, "url": url, "transcript_text": None,
-                    "error": result.get("error", "AWS Transcribe job failed"),
-                    "transcript_source": "failed",
-                }
         return {
-            **meta, "url": url, "transcript_text": None,
-            "transcript_source": "timeout", "job_name": job_name,
-            "next_step": f"Call get_transcription_result('{job_name}') to check.",
-        }
-
-    ydl_opts = make_ydl_opts(
-        writesubtitles=True,
-        writeautomaticsub=True,
-        subtitleslangs=[language],
-        skip_download=True,
-    )
-    try:
-        info = _extract_info_with_fallback(url, ydl_opts)
-    except yt_dlp.utils.ExtractorError as exc:
-        msg = str(exc)
-        if _is_auth_error(msg):
-            return {
-                "url": url,
-                "transcript_text": None,
-                "transcript_source": "failed",
-                "error": (
-                    "This video requires authentication even after trying alternative "
-                    "player clients (ios, tv_embedded). Set the YTDLP_COOKIES_FILE "
-                    "environment variable to a Netscape-format cookies.txt exported "
-                    "from a browser logged into YouTube. "
-                    f"Raw error: {msg[:300]}"
-                ),
-                "hint": "Export cookies: install 'Get cookies.txt LOCALLY' in Chrome, "
-                        "log into YouTube, click the extension → Export, save as cookies.txt, "
-                        "then set YTDLP_COOKIES_FILE=/path/to/cookies.txt on the server.",
-            }
-        return {
+            **meta,
             "url": url,
             "transcript_text": None,
             "transcript_source": "failed",
-            "error": f"Extraction failed: {msg[:400]}",
-        }
-    except Exception as exc:
-        return {
-            "url": url,
-            "transcript_text": None,
-            "transcript_source": "failed",
-            "error": f"Unexpected error during extraction: {str(exc)[:400]}",
+            "error": transcript_error,
         }
 
-    title = info.get("title")
-    uploader = info.get("uploader")
-    duration = info.get("duration")
-    upload_date = info.get("upload_date")
-
-    subtitles = info.get("subtitles", {}) or info.get("automatic_captions", {})
-    caption_url = None
-    caption_ext = None
-    if language in subtitles:
-        for fmt in subtitles[language]:
-            if fmt.get("ext") in ("json3", "vtt", "srv3"):
-                caption_url = fmt.get("url")
-                caption_ext = fmt.get("ext")
-                break
-
-    if caption_url:
-        try:
-            with urllib.request.urlopen(caption_url, timeout=30) as resp:
-                raw = resp.read().decode("utf-8")
-
-            # Parse json3 (YouTube's native format) into plain text
-            if caption_ext == "json3":
-                try:
-                    data = json.loads(raw)
-                    parts = []
-                    for event in data.get("events", []):
-                        segs = event.get("segs")
-                        if not segs:
-                            continue
-                        text = "".join(s.get("utf8", "") for s in segs).strip()
-                        if text and text != "\n":
-                            parts.append(text)
-                    transcript_text = " ".join(parts)
-                except Exception:
-                    transcript_text = raw[:8000]
-            else:
-                # VTT / SRV3: strip tags and timing lines
-                import re as _re
-                lines = []
-                for line in raw.splitlines():
-                    line = line.strip()
-                    if not line or "-->" in line or line.isdigit():
-                        continue
-                    line = _re.sub(r"<[^>]+>", "", line)
-                    if line:
-                        lines.append(line)
-                transcript_text = " ".join(lines)
-
-            _save_cache(cache_id, transcript_text, f"native_captions {url[:60]}")
-            return {
-                "title": title,
-                "uploader": uploader,
-                "duration_seconds": duration,
-                "upload_date": upload_date,
-                "url": url,
-                "language": language,
-                "transcript_text": transcript_text,
-                "transcript_source": "native_captions",
-                "char_count": len(transcript_text),
-            }
-        except Exception as exc:
-            pass  # caption fetch failed — fall through to audio transcription
-
-    # --- Step 2: No captions — stream audio to S3 and transcribe ---
-    # Cache key for non-YouTube URLs: hash of normalized URL + language
+    # ------------------------------------------------------------------
+    # Non-YouTube: S3 cache → AWS Transcribe only.
+    # Supadata is YouTube-specific; yt-dlp subtitle extraction is skipped
+    # to keep the path simple and avoid unnecessary bot-check attempts.
+    # ------------------------------------------------------------------
     import hashlib as _hashlib
     url_hash = _hashlib.sha1(url.encode()).hexdigest()[:16]
     cache_id = f"url_{url_hash}_{language}"
@@ -1751,7 +1629,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     if cached:
         print(f"[transcript-cache] hit url/{url_hash}/{language}", flush=True)
         return {
-            "title": title, "uploader": uploader, "url": url,
+            "url": url,
             "language": language,
             "transcript_text": cached,
             "transcript_source": "s3_cache",
@@ -1763,7 +1641,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
 
     if job.get("error"):
         return {
-            "title": title, "uploader": uploader, "url": url,
+            "url": url,
             "transcript_text": None,
             "error": job["error"],
             "transcript_source": "failed",
@@ -1781,10 +1659,6 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
             if transcript:
                 _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}")
             return {
-                "title": title,
-                "uploader": uploader,
-                "duration_seconds": duration,
-                "upload_date": upload_date,
                 "url": url,
                 "language": language,
                 "transcript_text": transcript,
@@ -1793,18 +1667,18 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
             }
         if status == "FAILED":
             return {
-                "title": title, "uploader": uploader, "url": url,
+                "url": url,
                 "transcript_text": None,
                 "error": result.get("error", "AWS Transcribe job failed"),
                 "transcript_source": "failed",
             }
 
     return {
-        "title": title, "uploader": uploader, "url": url,
+        "url": url,
         "transcript_text": None,
         "transcript_source": "timeout",
         "job_name": job_name,
-        "next_step": f"Job is still running. Call get_transcription_result('{job_name}') to check.",
+        "next_step": f"Call get_transcription_result('{job_name}') to check.",
     }
 
 

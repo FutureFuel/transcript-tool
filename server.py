@@ -1298,7 +1298,21 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
                 "audio/flac", "audio/wav", "audio/webm", "audio/aac",
                 "video/mp4", "video/webm",  # video containers often carry audio
             }
+            _ext_to_audio_ct = {
+                ".mp3": "audio/mpeg", ".m4a": "audio/x-m4a", ".mp4": "audio/mp4",
+                ".ogg": "audio/ogg", ".flac": "audio/flac", ".wav": "audio/wav",
+                ".webm": "audio/webm", ".aac": "audio/aac",
+            }
             ct_base = content_type.split(";")[0].strip().lower()
+            # Some CDNs (e.g. Substack) serve real audio files with the generic
+            # "binary/octet-stream" or "application/octet-stream" Content-Type.
+            # When that happens, fall back to the URL path extension to decide
+            # whether the response is actually audio.
+            if ct_base in ("binary/octet-stream", "application/octet-stream"):
+                import urllib.parse as _up
+                _path_ext = Path(_up.urlparse(final_url).path).suffix.lower()
+                if _path_ext in _ext_to_audio_ct:
+                    ct_base = _ext_to_audio_ct[_path_ext]
             if ct_base not in _audio_ct:
                 return {
                     "error": (

@@ -824,8 +824,11 @@ def get_source_metadata(url: str) -> dict:
     Extract metadata from any yt-dlp supported source without downloading.
     Used to validate a new source before adding it to the approved source list.
     """
-    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
+    try:
+        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if not info:
+            return {"url": url, "error": "yt-dlp returned no info for this URL"}
         return {
             "title": info.get("title"),
             "uploader": info.get("uploader"),
@@ -838,6 +841,12 @@ def get_source_metadata(url: str) -> dict:
             "extractor": info.get("extractor"),
             "is_live": info.get("is_live", False),
             "availability": info.get("availability"),
+        }
+    except Exception as exc:
+        return {
+            "url": url,
+            "error": str(exc)[:400],
+            "title": None, "uploader": None, "duration_seconds": None,
         }
 
 

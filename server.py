@@ -1513,22 +1513,28 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
                     ffmpeg_bin, _seg_iter(), _FFMPEG_AUDIO_ARGS, s3_client, bucket, audio_s3_key,
                 )
             else:
-                # Non-HLS: pass URL directly to ffmpeg (safe, no HTTP-client crash risk).
-                cmd = [ffmpeg_bin, "-y", "-i", stream_url] + _FFMPEG_AUDIO_ARGS + ["pipe:1"]
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                stderr_chunks_direct: list[bytes] = []
-                def _drain_stderr_direct() -> None:
-                    stderr_chunks_direct.append(proc.stderr.read())
-                dt = threading.Thread(target=_drain_stderr_direct, daemon=True)
-                dt.start()
-                try:
-                    s3_client.upload_fileobj(proc.stdout, bucket, audio_s3_key)
-                finally:
-                    proc.stdout.close()
-                    dt.join()
-                    proc.wait()
-                rc = proc.returncode
-                stderr_tail = b"".join(stderr_chunks_direct).decode(errors="replace")[-600:]
+                # Non-HLS: stream URL via Python → ffmpeg stdin → S3, bypassing
+                # ffmpeg's own HTTP/TLS client which segfaults (SIGSEGV / exit -11)
+                # on some container environments (e.g. Substack CDN URLs).
+                def _direct_chunk_iter(src_url: str, chunk_size: int = 65536):
+                    req = urllib.request.Request(
+                        src_url, headers={"User-Agent": "Mozilla/5.0"}
+                    )
+                    with urllib.request.urlopen(req, timeout=300) as resp:
+                        while True:
+                            chunk = resp.read(chunk_size)
+                            if not chunk:
+                                break
+                            yield chunk
+
+                rc, stderr_tail = _run_ffmpeg_with_stdin(
+                    ffmpeg_bin,
+                    _direct_chunk_iter(stream_url),
+                    _FFMPEG_AUDIO_ARGS,
+                    s3_client,
+                    bucket,
+                    audio_s3_key,
+                )
 
             if rc != 0:
                 return {

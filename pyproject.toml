@@ -210,6 +210,7 @@ installer = "uv"
 [tool.hatch.envs.default.scripts]
 setup = "pre-commit install --config .pre-commit-hatch.yaml"
 yt-dlp = "python -Werror -Xdev -m yt_dlp {args}"
+mcp = "python server.py"
 
 [tool.hatch.envs.hatch-uv]
 dependencies = [

@@ -824,9 +824,26 @@ def get_source_metadata(url: str) -> dict:
     Extract metadata from any yt-dlp supported source without downloading.
     Used to validate a new source before adding it to the approved source list.
     """
-    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
-        info = ydl.extract_info(url, download=False)
-    info = _enrich_metadata(url, info)
+    try:
+        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception as exc:
+        return {
+            "url": url,
+            "error": str(exc)[:400],
+            "title": None, "uploader": None, "upload_date": None,
+            "duration_seconds": None, "extractor": None,
+        }
+
+    if not info:
+        return {"url": url, "error": "yt-dlp returned no info for this URL",
+                "title": None, "uploader": None}
+
+    try:
+        info = _enrich_metadata(url, info)
+    except Exception:
+        pass  # enrichment is best-effort; use raw yt-dlp info on failure
+
     return {
         "title": info.get("title"),
         "uploader": info.get("uploader"),
@@ -1455,7 +1472,7 @@ def _enrich_metadata(url: str, info: dict) -> dict:
             patched["description"] = meta["description"]
         return patched
 
-    patched = dict(info)
+    patched = dict(info) if info else {}
 
     # --- Source 1: Substack REST API ---
     if _re.search(r"api\.substack\.com/feed/podcast/\d+/", url):

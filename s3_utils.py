@@ -119,6 +119,25 @@ def put_transcript(cache_key: str, text: str) -> None:
         pass
 
 
+def get_transcript_json(cache_key: str) -> dict | None:
+    """
+    Return the JSON object stored at ``transcripts/<cache_key>.json``, or None.
+    Silently returns None on any error (missing key, permission, parse failure, etc.).
+    """
+    import json as _json
+
+    s3_key = f"transcripts/{cache_key}.json"
+    try:
+        obj = _client().get_object(Bucket=bucket_name(), Key=s3_key)
+        return _json.loads(obj["Body"].read())
+    except ClientError as exc:
+        if exc.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        return None
+    except Exception:
+        return None
+
+
 def put_transcript_json(cache_key: str, data: dict) -> str | None:
     """
     Save *data* as ``transcripts/<cache_key>.json`` in the S3 bucket.

@@ -1220,6 +1220,21 @@ def check_duplicate(item_url: str, item_title: str, post_log: list[dict]) -> dic
     return {"is_duplicate": False, "recommendation": "include", "url": item_url, "title": item_title}
 
 
+def _title_from_url(u: str) -> str:
+    """
+    Derive a human-readable episode title from a direct audio URL when yt-dlp
+    returns no metadata (e.g. podtrac / swap.fm / simplecast redirect links).
+    Strips the file extension and converts hyphens/underscores to spaces.
+    """
+    import urllib.parse as _up
+    from pathlib import Path as _Path
+
+    stem = _Path(_up.urlparse(u).path).stem
+    if stem:
+        return stem.replace("-", " ").replace("_", " ").strip()[:80] or "podcast"
+    return "podcast"
+
+
 @mcp.tool()
 def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     """
@@ -1310,8 +1325,15 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             }
             audio_ext = _ct_map.get(ct_base, "mp3")
             stream_url = final_url
-            info = {"title": None, "uploader": None, "duration": None,
-                    "upload_date": None, "description": None}
+            # yt-dlp had no metadata — derive a title from the URL filename so
+            # the S3 key and returned title aren't just the generic "podcast".
+            info = {
+                "title": _title_from_url(final_url),
+                "uploader": None,
+                "duration": None,
+                "upload_date": None,
+                "description": None,
+            }
         except Exception as exc:
             return {
                 "error": f"Could not resolve audio URL (yt-dlp and direct fallback both failed): {exc}",
@@ -1564,6 +1586,20 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
         if ffmpeg_bin and audio_ext in ("mp3", "flac", "wav"):
             transcribe_kwargs["MediaSampleRateHertz"] = 16000
         transcribe.start_transcription_job(**transcribe_kwargs)
+
+        # Save a lightweight metadata sidecar so get_transcription_result can
+        # return title/uploader/duration without needing a second yt-dlp call.
+        s3_utils.put_transcript_json(
+            f"job-meta-{job_name}",
+            {
+                "url": url,
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "duration_seconds": info.get("duration"),
+                "upload_date": info.get("upload_date"),
+                "language_code": language_code,
+            },
+        )
     except Exception as exc:
         return {
             "error": f"Failed to start AWS Transcribe job: {exc}",
@@ -1639,9 +1675,18 @@ def get_transcription_result(job_name: str) -> dict:
     text_s3_key = f"transcripts/{job_name}_text.txt"
     s3_utils.put_transcript(f"{job_name}_text", transcript_text)
 
+    # Load the metadata sidecar saved by start_podcast_transcription so callers
+    # that invoke get_transcription_result directly still get episode metadata.
+    meta = s3_utils.get_transcript_json(f"job-meta-{job_name}") or {}
+
     return {
         "status": "COMPLETED",
         "job_name": job_name,
+        "title": meta.get("title"),
+        "uploader": meta.get("uploader"),
+        "duration_seconds": meta.get("duration_seconds"),
+        "upload_date": meta.get("upload_date"),
+        "url": meta.get("url"),
         "transcript": transcript_text,
         "transcript_s3_key": transcript_s3_key,
         "transcript_text_s3_key": text_s3_key,
@@ -1936,6 +1981,13 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     # --- Step 2: no native subtitles → AWS Transcribe ---
     language_code = language_code_map.get(language, f"{language}-{language.upper()}")
     job = start_podcast_transcription(url, language_code=language_code)
+
+    # Backfill metadata that yt-dlp may have found inside start_podcast_transcription
+    # but was lost because the earlier native-captions attempt threw an exception.
+    title = title or job.get("title")
+    uploader = uploader or job.get("uploader")
+    duration = duration or job.get("duration_seconds")
+    upload_date = upload_date or job.get("upload_date")
 
     if job.get("error"):
         return {

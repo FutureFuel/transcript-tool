@@ -1751,13 +1751,26 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         except Exception:
             return None
 
-    def _save_cache(identifier: str, text: str, source: str) -> str | None:
-        """Save transcript to S3 and return the S3 key, or None on error."""
+    def _save_cache(
+        identifier: str,
+        text: str,
+        source: str,
+        metadata: dict | None = None,
+    ) -> str | None:
+        """Save transcript to S3 and return the S3 key, or None on error.
+
+        When *metadata* is provided, a structured JSON file is also written
+        at ``transcripts/<key>.json`` alongside the plain-text ``.txt`` file.
+        """
         try:
             key = _cache_key_for(identifier)
             s3_utils.put_transcript(key, text)
             s3_key = f"transcripts/{key}.txt"
             print(f"[transcript-cache] saved {source} → {s3_key}", flush=True)
+            if metadata is not None:
+                json_key = s3_utils.put_transcript_json(key, metadata)
+                if json_key:
+                    print(f"[transcript-cache] saved JSON → {json_key}", flush=True)
             return s3_key
         except Exception:
             return None
@@ -1889,7 +1902,24 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 transcript_text = " ".join(lines)
 
             if transcript_text:
-                s3_key = _save_cache(cache_id, transcript_text, f"native_captions {url[:60]}")
+                import datetime as _dt
+                _meta = {
+                    "url": url,
+                    "title": title,
+                    "uploader": uploader,
+                    "duration_seconds": duration,
+                    "upload_date": upload_date,
+                    "language": language,
+                    "transcript_text": transcript_text,
+                    "transcript_source": "native_captions",
+                    "char_count": len(transcript_text),
+                    "fetched_at": _dt.datetime.utcnow().isoformat() + "Z",
+                }
+                s3_key = _save_cache(
+                    cache_id, transcript_text,
+                    f"native_captions {url[:60]}",
+                    metadata=_meta,
+                )
                 return {
                     "title": title, "uploader": uploader,
                     "duration_seconds": duration, "upload_date": upload_date,
@@ -1897,6 +1927,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                     "transcript_text": transcript_text,
                     "transcript_source": "native_captions",
                     "transcript_s3_key": s3_key,
+                    "transcript_json_s3_key": s3_key.replace(".txt", ".json") if s3_key else None,
                     "char_count": len(transcript_text),
                 }
     except Exception:
@@ -1922,7 +1953,23 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         status = result.get("status")
         if status == "COMPLETED":
             transcript = result.get("transcript") or ""
-            s3_key = _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}") if transcript else None
+            import datetime as _dt
+            _meta = {
+                "url": url,
+                "title": title,
+                "uploader": uploader,
+                "duration_seconds": duration,
+                "upload_date": upload_date,
+                "language": language,
+                "transcript_text": transcript,
+                "transcript_source": "aws_transcribe",
+                "char_count": len(transcript),
+                "fetched_at": _dt.datetime.utcnow().isoformat() + "Z",
+            }
+            s3_key = (
+                _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}", metadata=_meta)
+                if transcript else None
+            )
             return {
                 "title": title, "uploader": uploader,
                 "duration_seconds": duration, "upload_date": upload_date,
@@ -1930,6 +1977,7 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
                 "transcript_text": transcript,
                 "transcript_source": "aws_transcribe",
                 "transcript_s3_key": s3_key or result.get("transcript_text_s3_key"),
+                "transcript_json_s3_key": s3_key.replace(".txt", ".json") if s3_key else None,
                 "char_count": len(transcript),
             }
         if status == "FAILED":

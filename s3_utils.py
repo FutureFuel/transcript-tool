@@ -119,6 +119,27 @@ def put_transcript(cache_key: str, text: str) -> None:
         pass
 
 
+def put_transcript_json(cache_key: str, data: dict) -> str | None:
+    """
+    Save *data* as ``transcripts/<cache_key>.json`` in the S3 bucket.
+    Returns the S3 key on success, or None on any error.
+    Silently swallows errors so transcript delivery is never blocked by caching.
+    """
+    import json as _json
+
+    s3_key = f"transcripts/{cache_key}.json"
+    try:
+        _client().put_object(
+            Bucket=bucket_name(),
+            Key=s3_key,
+            Body=_json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+            ContentType="application/json; charset=utf-8",
+        )
+        return s3_key
+    except Exception:
+        return None
+
+
 def upload_audio_and_cleanup(output_dir: str | Path, title: str, audio_format: str) -> dict:
     """
     Find the converted audio file inside *output_dir*, upload it to S3,

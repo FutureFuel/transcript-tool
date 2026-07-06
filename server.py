@@ -1964,7 +1964,15 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
 
     # --- Step 2: no native subtitles → AWS Transcribe ---
     language_code = language_code_map.get(language, f"{language}-{language.upper()}")
-    job = start_podcast_transcription(url, language_code=language_code)
+    try:
+        job = start_podcast_transcription(url, language_code=language_code)
+    except Exception as exc:
+        return {
+            "title": title, "uploader": uploader, "url": url,
+            "transcript_text": None,
+            "error": f"start_podcast_transcription raised an unexpected error: {type(exc).__name__}: {exc}",
+            "transcript_source": "failed",
+        }
 
     if job.get("error"):
         return {
@@ -1975,47 +1983,63 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
         }
 
     job_name = job.get("job_name")
+    if not job_name:
+        return {
+            "title": title, "uploader": uploader, "url": url,
+            "transcript_text": None,
+            "error": f"start_podcast_transcription returned no job_name: {job}",
+            "transcript_source": "failed",
+        }
 
-    for _ in range(48):
-        time.sleep(10)
-        result = get_transcription_result(job_name)
-        status = result.get("status")
-        if status == "COMPLETED":
-            transcript = result.get("transcript") or ""
-            import datetime as _dt
-            _meta = {
-                "url": url,
-                "title": title,
-                "uploader": uploader,
-                "duration_seconds": duration,
-                "upload_date": upload_date,
-                "language": language,
-                "transcript_text": transcript,
-                "transcript_source": "aws_transcribe",
-                "char_count": len(transcript),
-                "fetched_at": _dt.datetime.utcnow().isoformat() + "Z",
-            }
-            s3_key = (
-                _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}", metadata=_meta)
-                if transcript else None
-            )
-            return {
-                "title": title, "uploader": uploader,
-                "duration_seconds": duration, "upload_date": upload_date,
-                "url": url, "language": language,
-                "transcript_text": transcript,
-                "transcript_source": "aws_transcribe",
-                "transcript_s3_key": s3_key or result.get("transcript_text_s3_key"),
-                "transcript_json_s3_key": s3_key.replace(".txt", ".json") if s3_key else None,
-                "char_count": len(transcript),
-            }
-        if status == "FAILED":
-            return {
-                "title": title, "uploader": uploader, "url": url,
-                "transcript_text": None,
-                "error": result.get("error", "AWS Transcribe job failed"),
-                "transcript_source": "failed",
-            }
+    try:
+        for _ in range(48):
+            time.sleep(10)
+            result = get_transcription_result(job_name)
+            status = result.get("status")
+            if status == "COMPLETED":
+                transcript = result.get("transcript") or ""
+                import datetime as _dt
+                _meta = {
+                    "url": url,
+                    "title": title,
+                    "uploader": uploader,
+                    "duration_seconds": duration,
+                    "upload_date": upload_date,
+                    "language": language,
+                    "transcript_text": transcript,
+                    "transcript_source": "aws_transcribe",
+                    "char_count": len(transcript),
+                    "fetched_at": _dt.datetime.utcnow().isoformat() + "Z",
+                }
+                s3_key = (
+                    _save_cache(cache_id, transcript, f"aws_transcribe {url[:60]}", metadata=_meta)
+                    if transcript else None
+                )
+                return {
+                    "title": title, "uploader": uploader,
+                    "duration_seconds": duration, "upload_date": upload_date,
+                    "url": url, "language": language,
+                    "transcript_text": transcript,
+                    "transcript_source": "aws_transcribe",
+                    "transcript_s3_key": s3_key or result.get("transcript_text_s3_key"),
+                    "transcript_json_s3_key": s3_key.replace(".txt", ".json") if s3_key else None,
+                    "char_count": len(transcript),
+                }
+            if status == "FAILED":
+                return {
+                    "title": title, "uploader": uploader, "url": url,
+                    "transcript_text": None,
+                    "error": result.get("error", "AWS Transcribe job failed"),
+                    "transcript_source": "failed",
+                }
+    except Exception as exc:
+        return {
+            "title": title, "uploader": uploader, "url": url,
+            "transcript_text": None,
+            "error": f"Error while polling transcription job '{job_name}': {type(exc).__name__}: {exc}",
+            "transcript_source": "failed",
+            "job_name": job_name,
+        }
 
     return {
         "title": title, "uploader": uploader, "url": url,

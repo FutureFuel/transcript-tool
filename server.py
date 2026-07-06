@@ -2070,4 +2070,17 @@ def check_server_config() -> dict:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    import sys as _sys
+
+    # When the deployment runner sets FASTMCP_PORT (HTTP mode), bind on 0.0.0.0
+    # so the gateway health-checker can reach the server without "Invalid HTTP
+    # request received" warnings and the resulting 421 Misdirected Request cycle.
+    _port = os.environ.get("FASTMCP_PORT") or os.environ.get("MCP_PORT")
+    if _port:
+        try:
+            mcp.run(transport="http", host="0.0.0.0", port=int(_port))
+        except TypeError:
+            # Older FastMCP builds don't accept host/port kwargs — fall back.
+            mcp.run()
+    else:
+        mcp.run()

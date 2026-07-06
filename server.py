@@ -1323,15 +1323,15 @@ def _title_from_url(u: str) -> str:
 def _fetch_substack_metadata(url: str) -> dict | None:
     """
     For Substack podcast CDN URLs (api.substack.com/feed/podcast/{post_id}/...),
-    call the Substack REST API to retrieve the real episode title, publication
-    name, and upload date.
+    retrieve the real episode title, publication name, and upload date.
 
-    The yt-dlp generic extractor reads ID3 tags from these files, which often
-    contain ffmpeg encoder artifacts (title="transcoded", duration=null) rather
-    than the actual episode metadata.
+    Tries multiple approaches in order:
+      1. GET substack.com/api/v1/posts/{post_id}        — primary REST endpoint
+      2. GET api.substack.com/api/v1/posts/{post_id}    — alternate subdomain
+      3. yt-dlp SubstackIE via open.substack.com/p/{post_id}  — webpage fallback
 
-    Returns a partial yt-dlp-style info dict or None if the URL is not a
-    Substack API URL or the API call fails.
+    Returns a partial yt-dlp-style info dict or None on complete failure.
+    Logs each attempt so failures are visible in the server output.
     """
     import json as _json
     import re as _re
@@ -1341,31 +1341,81 @@ def _fetch_substack_metadata(url: str) -> dict | None:
         return None
 
     post_id = m.group(1)
-    try:
-        req = urllib.request.Request(
-            f"https://substack.com/api/v1/posts/{post_id}",
-            headers={"User-Agent": "Mozilla/5.0"},
+    print(f"[substack] fetching metadata for post_id={post_id}", flush=True)
+
+    def _parse_post_json(data: dict) -> dict | None:
+        """Extract fields from a Substack API JSON response (flat or nested)."""
+        # Some endpoints nest under 'post', others return a flat dict.
+        post = data.get("post") if isinstance(data.get("post"), dict) else data
+        pub  = data.get("pub") or data.get("publication") or {}
+
+        title = post.get("title")
+        if not title:
+            return None
+
+        raw_date = post.get("post_date") or post.get("publishedAt") or ""
+        upload_date = str(raw_date)[:10].replace("-", "") if len(str(raw_date)) >= 10 else None
+        uploader = (
+            pub.get("name")
+            or post.get("publication_name")
+            or post.get("pub_name")
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read())
-
-        # Normalise the publish date to yt-dlp's YYYYMMDD format.
-        raw_date = data.get("post_date") or data.get("publishedAt") or ""
-        upload_date = raw_date[:10].replace("-", "") if len(raw_date) >= 10 else None
-
-        # Publication name may be nested under "pub" or "publication".
-        pub = data.get("pub") or data.get("publication") or {}
-        uploader = pub.get("name") or data.get("pub_name") or data.get("publication_name")
-
         return {
-            "title": data.get("title"),
+            "title": title,
             "uploader": uploader,
-            "duration": data.get("duration"),
+            "duration": post.get("duration"),
             "upload_date": upload_date,
-            "description": data.get("description") or data.get("subtitle"),
+            "description": post.get("description") or post.get("subtitle"),
         }
-    except Exception:
-        return None
+
+    # --- Attempt 1 & 2: direct REST API ---
+    for api_url in [
+        f"https://substack.com/api/v1/posts/{post_id}",
+        f"https://api.substack.com/api/v1/posts/{post_id}",
+    ]:
+        try:
+            req = urllib.request.Request(
+                api_url,
+                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+
+            print(
+                f"[substack] {api_url} → "
+                f"keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}",
+                flush=True,
+            )
+            result = _parse_post_json(data)
+            if result:
+                print(f"[substack] resolved: title={result['title']!r}", flush=True)
+                return result
+            print(f"[substack] {api_url}: no title in response", flush=True)
+        except Exception as exc:
+            print(f"[substack] {api_url} failed: {type(exc).__name__}: {exc}", flush=True)
+
+    # --- Attempt 3: yt-dlp SubstackIE via the open.substack.com universal reader ---
+    # open.substack.com/p/{post_id} redirects to the real post page; SubstackIE
+    # can then parse window._preloads from the HTML to get full episode metadata.
+    try:
+        open_url = f"https://open.substack.com/p/{post_id}"
+        print(f"[substack] trying yt-dlp SubstackIE via {open_url}", flush=True)
+        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+            info = ydl.extract_info(open_url, download=False)
+        if info and info.get("title") and info["title"] not in _GENERIC_TITLES:
+            print(f"[substack] SubstackIE resolved: title={info['title']!r}", flush=True)
+            return {
+                "title": info.get("title"),
+                "uploader": info.get("uploader"),
+                "duration": info.get("duration"),
+                "upload_date": info.get("upload_date"),
+                "description": info.get("description"),
+            }
+    except Exception as exc:
+        print(f"[substack] SubstackIE fallback failed: {type(exc).__name__}: {exc}", flush=True)
+
+    print(f"[substack] all approaches failed for post_id={post_id}", flush=True)
+    return None
 
 
 # Known bad title values written by ffmpeg/encoding pipelines into ID3 tags.
@@ -1410,11 +1460,11 @@ def _enrich_metadata(url: str, info: dict) -> dict:
     # --- Source 1: Substack REST API ---
     if _re.search(r"api\.substack\.com/feed/podcast/\d+/", url):
         meta = _fetch_substack_metadata(url)
-        if meta:
+        if meta and meta.get("title"):
             patched = _apply(patched, meta)
-        # Return early — if we matched Substack there's no need to call
-        # the Podcast Index for the same URL.
-        return patched
+            # Substack API succeeded — no need to hit Podcast Index for same URL.
+            return patched
+        # Substack API failed — fall through to Podcast Index below.
 
     # --- Source 2: Podcast Index API (general podcast fallback) ---
     # Only call if the title is still bad; avoids burning API quota when

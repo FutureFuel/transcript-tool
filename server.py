@@ -824,39 +824,21 @@ def get_source_metadata(url: str) -> dict:
     Extract metadata from any yt-dlp supported source without downloading.
     Used to validate a new source before adding it to the approved source list.
     """
-    try:
-        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as exc:
+    with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
+        info = ydl.extract_info(url, download=False)
         return {
-            "url": url,
-            "error": str(exc)[:400],
-            "title": None, "uploader": None, "upload_date": None,
-            "duration_seconds": None, "extractor": None,
+            "title": info.get("title"),
+            "uploader": info.get("uploader"),
+            "upload_date": info.get("upload_date"),
+            "duration_seconds": info.get("duration"),
+            "view_count": info.get("view_count"),
+            "like_count": info.get("like_count"),
+            "description": (info.get("description") or "")[:800],
+            "webpage_url": info.get("webpage_url"),
+            "extractor": info.get("extractor"),
+            "is_live": info.get("is_live", False),
+            "availability": info.get("availability"),
         }
-
-    if not info:
-        return {"url": url, "error": "yt-dlp returned no info for this URL",
-                "title": None, "uploader": None}
-
-    try:
-        info = _enrich_metadata(url, info)
-    except Exception:
-        pass  # enrichment is best-effort; use raw yt-dlp info on failure
-
-    return {
-        "title": info.get("title"),
-        "uploader": info.get("uploader"),
-        "upload_date": info.get("upload_date"),
-        "duration_seconds": info.get("duration"),
-        "view_count": info.get("view_count"),
-        "like_count": info.get("like_count"),
-        "description": (info.get("description") or "")[:800],
-        "webpage_url": info.get("webpage_url"),
-        "extractor": info.get("extractor"),
-        "is_live": info.get("is_live", False),
-        "availability": info.get("availability"),
-    }
 
 
 @mcp.tool()
@@ -1238,262 +1220,6 @@ def check_duplicate(item_url: str, item_title: str, post_log: list[dict]) -> dic
     return {"is_duplicate": False, "recommendation": "include", "url": item_url, "title": item_title}
 
 
-def _fetch_podcastindex_metadata(audio_url: str) -> dict | None:
-    """
-    Look up episode metadata from the Podcast Index API using the audio file URL.
-
-    The Podcast Index is a free, community-maintained podcast directory that
-    indexes ~4 M feeds. It can resolve any public podcast audio URL (Megaphone,
-    Buzzsprout, Libsyn, etc.) back to its episode record.
-
-    Requires env vars:
-      PODCAST_INDEX_API_KEY    — from podcastindex.org/developer
-      PODCAST_INDEX_API_SECRET — from podcastindex.org/developer
-
-    Returns a partial yt-dlp-style info dict or None if credentials are missing
-    or the lookup fails.
-    """
-    import hashlib as _hashlib
-    import json as _json
-    import time as _time
-
-    api_key = os.environ.get("PODCAST_INDEX_API_KEY", "")
-    api_secret = os.environ.get("PODCAST_INDEX_API_SECRET", "")
-    if not api_key or not api_secret:
-        return None
-
-    ts = str(int(_time.time()))
-    auth_hash = _hashlib.sha1(f"{api_key}{api_secret}{ts}".encode()).hexdigest()
-
-    try:
-        import urllib.parse as _up
-        params = _up.urlencode({"url": audio_url, "max": 1})
-        req = urllib.request.Request(
-            f"https://api.podcastindex.org/api/1.0/episodes/byurl?{params}",
-            headers={
-                "User-Agent": "yt-dlp-server/1.0",
-                "X-Auth-Key": api_key,
-                "X-Auth-Date": ts,
-                "Authorization": auth_hash,
-            },
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = _json.loads(resp.read())
-
-        items = data.get("items") or data.get("episodes") or []
-        if not items:
-            return None
-        ep = items[0]
-
-        raw_date = ep.get("datePublished") or ep.get("publishedAt") or ""
-        if isinstance(raw_date, int):
-            import datetime as _dt
-            upload_date = _dt.datetime.utcfromtimestamp(raw_date).strftime("%Y%m%d")
-        else:
-            upload_date = str(raw_date)[:10].replace("-", "") if raw_date else None
-
-        return {
-            "title": ep.get("title"),
-            "uploader": ep.get("feedTitle"),
-            "duration": ep.get("duration"),
-            "upload_date": upload_date,
-            "description": ep.get("description"),
-        }
-    except Exception:
-        return None
-
-
-def _title_from_url(u: str) -> str:
-    """
-    Derive a human-readable episode title from a direct audio URL when yt-dlp
-    returns no metadata (e.g. podtrac / swap.fm / simplecast redirect links).
-
-    Resolution order:
-      1. Substack REST API   — for api.substack.com/feed/podcast/ URLs
-      2. Podcast Index API   — general lookup by audio URL (if credentials set)
-      3. URL filename stem   — last resort; skips bare IDs (UUIDs, all-caps IDs
-                               like Megaphone's NVC…)
-    """
-    import re as _re
-    import urllib.parse as _up
-    from pathlib import Path as _Path
-
-    # 1. Substack REST API
-    substack = _fetch_substack_metadata(u)
-    if substack and substack.get("title"):
-        return substack["title"]
-
-    # 2. Podcast Index API
-    pi = _fetch_podcastindex_metadata(u)
-    if pi and pi.get("title"):
-        return pi["title"]
-
-    # 3. URL stem — skip stems that look like opaque IDs
-    stem = _Path(_up.urlparse(u).path).stem
-    if stem:
-        # UUID (32 hex chars) or all-uppercase ID (e.g. NVC6266348181, ABC123)
-        if not _re.fullmatch(r"[0-9a-f]{32}", stem) and not _re.fullmatch(r"[A-Z0-9]{6,}", stem):
-            return stem.replace("-", " ").replace("_", " ").strip()[:80] or "podcast"
-    return "podcast"
-
-
-def _fetch_substack_metadata(url: str) -> dict | None:
-    """
-    For Substack podcast CDN URLs (api.substack.com/feed/podcast/{post_id}/...),
-    retrieve the real episode title, publication name, and upload date.
-
-    Tries multiple approaches in order:
-      1. GET substack.com/api/v1/posts/{post_id}        — primary REST endpoint
-      2. GET api.substack.com/api/v1/posts/{post_id}    — alternate subdomain
-      3. yt-dlp SubstackIE via open.substack.com/p/{post_id}  — webpage fallback
-
-    Returns a partial yt-dlp-style info dict or None on complete failure.
-    Logs each attempt so failures are visible in the server output.
-    """
-    import json as _json
-    import re as _re
-
-    m = _re.search(r"api\.substack\.com/feed/podcast/(\d+)/", url)
-    if not m:
-        return None
-
-    post_id = m.group(1)
-    print(f"[substack] fetching metadata for post_id={post_id}", flush=True)
-
-    def _parse_post_json(data: dict) -> dict | None:
-        """Extract fields from a Substack API JSON response (flat or nested)."""
-        # Some endpoints nest under 'post', others return a flat dict.
-        post = data.get("post") if isinstance(data.get("post"), dict) else data
-        pub  = data.get("pub") or data.get("publication") or {}
-
-        title = post.get("title")
-        if not title:
-            return None
-
-        raw_date = post.get("post_date") or post.get("publishedAt") or ""
-        upload_date = str(raw_date)[:10].replace("-", "") if len(str(raw_date)) >= 10 else None
-        uploader = (
-            pub.get("name")
-            or post.get("publication_name")
-            or post.get("pub_name")
-        )
-        return {
-            "title": title,
-            "uploader": uploader,
-            "duration": post.get("duration"),
-            "upload_date": upload_date,
-            "description": post.get("description") or post.get("subtitle"),
-        }
-
-    # --- Attempt 1 & 2: direct REST API ---
-    for api_url in [
-        f"https://substack.com/api/v1/posts/{post_id}",
-        f"https://api.substack.com/api/v1/posts/{post_id}",
-    ]:
-        try:
-            req = urllib.request.Request(
-                api_url,
-                headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = _json.loads(resp.read())
-
-            print(
-                f"[substack] {api_url} → "
-                f"keys={list(data.keys()) if isinstance(data, dict) else type(data).__name__}",
-                flush=True,
-            )
-            result = _parse_post_json(data)
-            if result:
-                print(f"[substack] resolved: title={result['title']!r}", flush=True)
-                return result
-            print(f"[substack] {api_url}: no title in response", flush=True)
-        except Exception as exc:
-            print(f"[substack] {api_url} failed: {type(exc).__name__}: {exc}", flush=True)
-
-    # --- Attempt 3: yt-dlp SubstackIE via the open.substack.com universal reader ---
-    # open.substack.com/p/{post_id} redirects to the real post page; SubstackIE
-    # can then parse window._preloads from the HTML to get full episode metadata.
-    try:
-        open_url = f"https://open.substack.com/p/{post_id}"
-        print(f"[substack] trying yt-dlp SubstackIE via {open_url}", flush=True)
-        with yt_dlp.YoutubeDL(make_ydl_opts()) as ydl:
-            info = ydl.extract_info(open_url, download=False)
-        if info and info.get("title") and info["title"] not in _GENERIC_TITLES:
-            print(f"[substack] SubstackIE resolved: title={info['title']!r}", flush=True)
-            return {
-                "title": info.get("title"),
-                "uploader": info.get("uploader"),
-                "duration": info.get("duration"),
-                "upload_date": info.get("upload_date"),
-                "description": info.get("description"),
-            }
-    except Exception as exc:
-        print(f"[substack] SubstackIE fallback failed: {type(exc).__name__}: {exc}", flush=True)
-
-    print(f"[substack] all approaches failed for post_id={post_id}", flush=True)
-    return None
-
-
-# Known bad title values written by ffmpeg/encoding pipelines into ID3 tags.
-_GENERIC_TITLES = frozenset({
-    "transcoded", "podcast", "audio", "untitled", "unknown", "", None,
-})
-
-
-def _enrich_metadata(url: str, info: dict) -> dict:
-    """
-    Post-process a yt-dlp info dict to fix bad metadata from the generic
-    extractor.
-
-    Enrichment sources (tried in order, first match wins):
-      1. Substack REST API — for api.substack.com/feed/podcast/{post_id}/ URLs
-         where yt-dlp reads ffmpeg ID3 artifacts (title="transcoded").
-      2. Podcast Index API — general fallback for any podcast audio URL
-         (Megaphone, Buzzsprout, cohst.app, podtrac, etc.) when the title is
-         missing or a known-bad value.  Requires PODCAST_INDEX_API_KEY +
-         PODCAST_INDEX_API_SECRET env vars (free at podcastindex.org/developer).
-
-    Returns an updated copy of *info*; never mutates the original.
-    """
-    import re as _re
-
-    def _apply(patched: dict, meta: dict) -> dict:
-        """Overlay non-null fields from *meta* onto *patched* when needed."""
-        if patched.get("title") in _GENERIC_TITLES and meta.get("title"):
-            patched["title"] = meta["title"]
-        if not patched.get("uploader") and meta.get("uploader"):
-            patched["uploader"] = meta["uploader"]
-        if not patched.get("duration") and meta.get("duration"):
-            patched["duration"] = meta["duration"]
-        if not patched.get("upload_date") and meta.get("upload_date"):
-            patched["upload_date"] = meta["upload_date"]
-        if not patched.get("description") and meta.get("description"):
-            patched["description"] = meta["description"]
-        return patched
-
-    patched = dict(info) if info else {}
-
-    # --- Source 1: Substack REST API ---
-    if _re.search(r"api\.substack\.com/feed/podcast/\d+/", url):
-        meta = _fetch_substack_metadata(url)
-        if meta and meta.get("title"):
-            patched = _apply(patched, meta)
-            # Substack API succeeded — no need to hit Podcast Index for same URL.
-            return patched
-        # Substack API failed — fall through to Podcast Index below.
-
-    # --- Source 2: Podcast Index API (general podcast fallback) ---
-    # Only call if the title is still bad; avoids burning API quota when
-    # the generic extractor already returned good metadata.
-    if patched.get("title") in _GENERIC_TITLES or not patched.get("title"):
-        meta = _fetch_podcastindex_metadata(url)
-        if meta:
-            patched = _apply(patched, meta)
-
-    return patched
-
-
 @mcp.tool()
 def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     """
@@ -1526,8 +1252,6 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     try:
         ydl_opts = make_ydl_opts(format="bestaudio[ext=m4a]/bestaudio[ext=mp4]/bestaudio/best")
         info = _extract_info_with_fallback(url, ydl_opts)
-        # Fix bad ID3-tag metadata (e.g. title="transcoded") for Substack CDN URLs.
-        info = _enrich_metadata(url, info)
 
         formats = info.get("formats") or []
 
@@ -1586,15 +1310,8 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
             }
             audio_ext = _ct_map.get(ct_base, "mp3")
             stream_url = final_url
-            # yt-dlp had no metadata — derive a title from the URL filename so
-            # the S3 key and returned title aren't just the generic "podcast".
-            info = {
-                "title": _title_from_url(final_url),
-                "uploader": None,
-                "duration": None,
-                "upload_date": None,
-                "description": None,
-            }
+            info = {"title": None, "uploader": None, "duration": None,
+                    "upload_date": None, "description": None}
         except Exception as exc:
             return {
                 "error": f"Could not resolve audio URL (yt-dlp and direct fallback both failed): {exc}",
@@ -1847,20 +1564,6 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
         if ffmpeg_bin and audio_ext in ("mp3", "flac", "wav"):
             transcribe_kwargs["MediaSampleRateHertz"] = 16000
         transcribe.start_transcription_job(**transcribe_kwargs)
-
-        # Save a lightweight metadata sidecar so get_transcription_result can
-        # return title/uploader/duration without needing a second yt-dlp call.
-        s3_utils.put_transcript_json(
-            f"job-meta-{job_name}",
-            {
-                "url": url,
-                "title": info.get("title"),
-                "uploader": info.get("uploader"),
-                "duration_seconds": info.get("duration"),
-                "upload_date": info.get("upload_date"),
-                "language_code": language_code,
-            },
-        )
     except Exception as exc:
         return {
             "error": f"Failed to start AWS Transcribe job: {exc}",
@@ -1936,18 +1639,9 @@ def get_transcription_result(job_name: str) -> dict:
     text_s3_key = f"transcripts/{job_name}_text.txt"
     s3_utils.put_transcript(f"{job_name}_text", transcript_text)
 
-    # Load the metadata sidecar saved by start_podcast_transcription so callers
-    # that invoke get_transcription_result directly still get episode metadata.
-    meta = s3_utils.get_transcript_json(f"job-meta-{job_name}") or {}
-
     return {
         "status": "COMPLETED",
         "job_name": job_name,
-        "title": meta.get("title"),
-        "uploader": meta.get("uploader"),
-        "duration_seconds": meta.get("duration_seconds"),
-        "upload_date": meta.get("upload_date"),
-        "url": meta.get("url"),
         "transcript": transcript_text,
         "transcript_s3_key": transcript_s3_key,
         "transcript_text_s3_key": text_s3_key,
@@ -2170,7 +1864,6 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     try:
         ydl_opts = make_ydl_opts(skip_download=True)
         info = _extract_info_with_fallback(url, ydl_opts)
-        info = _enrich_metadata(url, info)
         title = info.get("title")
         uploader = info.get("uploader")
         duration = info.get("duration")
@@ -2243,13 +1936,6 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     # --- Step 2: no native subtitles → AWS Transcribe ---
     language_code = language_code_map.get(language, f"{language}-{language.upper()}")
     job = start_podcast_transcription(url, language_code=language_code)
-
-    # Backfill metadata that yt-dlp may have found inside start_podcast_transcription
-    # but was lost because the earlier native-captions attempt threw an exception.
-    title = title or job.get("title")
-    uploader = uploader or job.get("uploader")
-    duration = duration or job.get("duration_seconds")
-    upload_date = upload_date or job.get("upload_date")
 
     if job.get("error"):
         return {
@@ -2370,16 +2056,6 @@ def check_server_config() -> dict:
         "aws": {
             "S3_BUCKET": os.environ.get("S3_BUCKET", "(not set)"),
             "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
-        },
-        "podcast_index": {
-            "PODCAST_INDEX_API_KEY": "set ✓" if os.environ.get("PODCAST_INDEX_API_KEY") else "NOT SET — metadata enrichment disabled for Megaphone/cohst.app/generic podcast URLs",
-            "PODCAST_INDEX_API_SECRET": "set ✓" if os.environ.get("PODCAST_INDEX_API_SECRET") else "NOT SET",
-            "note": (
-                "Free API key at podcastindex.org/developer — enables title/uploader "
-                "lookup for any podcast audio URL where ID3 tags are missing or bad."
-                if not os.environ.get("PODCAST_INDEX_API_KEY") else
-                "Podcast Index metadata enrichment active."
-            ),
         },
     }
 

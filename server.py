@@ -2051,6 +2051,76 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
 
 
 @mcp.tool()
+def find_podcast_rss_feed(name: str, max_results: int = 5) -> dict:
+    """
+    Look up a podcast by name via the Podcast Index API and return its RSS
+    feed URL. The best match is returned as feed_url, with up to max_results
+    alternates in case the first match is wrong.
+    Requires PODCASTINDEX_API_KEY and PODCASTINDEX_API_SECRET environment
+    variables (free credentials from https://api.podcastindex.org/).
+    """
+    import hashlib
+    import json as _json
+    import time as _time
+    import urllib.parse as _up
+
+    api_key = os.environ.get("PODCASTINDEX_API_KEY", "")
+    api_secret = os.environ.get("PODCASTINDEX_API_SECRET", "")
+    if not api_key or not api_secret:
+        return {
+            "query": name,
+            "feed_url": None,
+            "error": (
+                "PODCASTINDEX_API_KEY and PODCASTINDEX_API_SECRET are not set. "
+                "Get free credentials at https://api.podcastindex.org/"
+            ),
+        }
+
+    # Podcast Index auth: sha1(key + secret + unix_time) with matching X-Auth-Date.
+    auth_date = str(int(_time.time()))
+    auth_hash = hashlib.sha1((api_key + api_secret + auth_date).encode()).hexdigest()
+    params = _up.urlencode({"q": name, "max": max_results})
+    request = urllib.request.Request(
+        f"https://api.podcastindex.org/api/1.0/search/byterm?{params}",
+        headers={
+            "User-Agent": "yt-dlp-mcp-server/1.0",
+            "X-Auth-Key": api_key,
+            "X-Auth-Date": auth_date,
+            "Authorization": auth_hash,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = _json.load(response)
+    except Exception as exc:
+        return {"query": name, "feed_url": None, "error": str(exc)[:400]}
+
+    feeds = data.get("feeds") or []
+    if not feeds:
+        return {"query": name, "feed_url": None, "error": f"No podcasts found for: {name}"}
+
+    matches = [
+        {
+            "title": feed.get("title"),
+            "author": feed.get("author"),
+            "feed_url": feed.get("url"),
+            "description": (feed.get("description") or "")[:300],
+            "episode_count": feed.get("episodeCount"),
+            "last_update_time": feed.get("lastUpdateTime"),
+        }
+        for feed in feeds
+    ]
+    best = matches[0]
+    return {
+        "query": name,
+        "title": best["title"],
+        "author": best["author"],
+        "feed_url": best["feed_url"],
+        "matches": matches,
+    }
+
+
+@mcp.tool()
 def check_server_config() -> dict:
     """
     Diagnostic tool — shows the server's current runtime configuration.

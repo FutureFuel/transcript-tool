@@ -1230,7 +1230,12 @@ def check_duplicate(item_url: str, item_title: str, post_log: list[dict]) -> dic
 
 
 @mcp.tool()
-def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
+def start_podcast_transcription(
+    url: str,
+    language_code: str = "en-US",
+    title: str = "",
+    uploader: str = "",
+) -> dict:
     """
     Start transcribing a podcast episode with ZERO local disk usage.
     Downloads audio into memory, uploads to S3, and kicks off an AWS
@@ -1240,6 +1245,10 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
     time limits. Supports direct MP3/M4A URLs and tracking redirect links
     (swap.fm, podtrac, simplecast, etc.) as well as YouTube and other
     yt-dlp supported sources.
+    Pass title (and optionally uploader) when transcribing a direct audio
+    URL from get_podcast_episodes — direct .mp3 links carry no metadata,
+    so this keeps the episode title attached to the URL in the result and
+    in the S3 object name.
     """
     import io
     import uuid
@@ -1345,6 +1354,13 @@ def start_podcast_transcription(url: str, language_code: str = "en-US") -> dict:
 
     if not stream_url:
         return {"error": "Could not resolve a direct audio stream URL", "url": url, "step": "select_format"}
+
+    # Caller-supplied metadata (e.g. from get_podcast_episodes) wins over
+    # whatever yt-dlp/direct-URL resolution found — direct .mp3 links have none.
+    if title:
+        info["title"] = title
+    if uploader:
+        info["uploader"] = uploader
 
     import threading
 
@@ -1739,9 +1755,18 @@ def normalize_youtube_url(url: str) -> dict:
 
 
 @mcp.tool()
-def get_transcript_text(url: str, language: str = "en") -> dict:
+def get_transcript_text(
+    url: str,
+    language: str = "en",
+    title: str = "",
+    uploader: str = "",
+) -> dict:
     """
     Get the full transcript text for any video or audio URL in a single call.
+
+    Pass title (and optionally uploader) when the URL is a direct audio file
+    from get_podcast_episodes — direct .mp3 links carry no metadata, so this
+    keeps the episode title attached to the URL in the result and S3 cache.
 
     YouTube strategy (free methods first, paid last):
       1. S3 cache (instant, free)
@@ -1878,6 +1903,8 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     if cached:
         print(f"[transcript-cache] hit url/{url_hash}/{language}", flush=True)
         return {
+            "title": title or None,
+            "uploader": uploader or None,
             "url": url,
             "language": language,
             "transcript_text": cached,
@@ -1889,12 +1916,16 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     # Do NOT pass writesubtitles/writeautomaticsub — those cause yt-dlp to write
     # .vtt files to disk even with skip_download=True.  We extract the caption URLs
     # from the info dict and download them in memory ourselves (see below).
-    title = uploader = duration = upload_date = None
+    # Caller-supplied title/uploader (e.g. from get_podcast_episodes) take
+    # precedence — direct audio URLs yield no metadata from extraction.
+    title = title or None
+    uploader = uploader or None
+    duration = upload_date = None
     try:
         ydl_opts = make_ydl_opts(skip_download=True)
         info = _extract_info_with_fallback(url, ydl_opts)
-        title = info.get("title")
-        uploader = info.get("uploader")
+        title = title or info.get("title")
+        uploader = uploader or info.get("uploader")
         duration = info.get("duration")
         upload_date = info.get("upload_date")
 
@@ -1965,7 +1996,12 @@ def get_transcript_text(url: str, language: str = "en") -> dict:
     # --- Step 2: no native subtitles → AWS Transcribe ---
     language_code = language_code_map.get(language, f"{language}-{language.upper()}")
     try:
-        job = start_podcast_transcription(url, language_code=language_code)
+        job = start_podcast_transcription(
+            url,
+            language_code=language_code,
+            title=title or "",
+            uploader=uploader or "",
+        )
     except Exception as exc:
         return {
             "title": title, "uploader": uploader, "url": url,
@@ -2117,6 +2153,227 @@ def find_podcast_rss_feed(name: str, max_results: int = 5) -> dict:
         "author": best["author"],
         "feed_url": best["feed_url"],
         "matches": matches,
+    }
+
+
+# ─────────────────────────────────────────────
+# RSS feed traversal (podcasts + news/article feeds)
+# ─────────────────────────────────────────────
+
+_RSS_NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "itunes": "http://www.itunes.com/dtds/podcast-1.0.dtd",
+    "media": "http://search.yahoo.com/mrss/",
+    "content": "http://purl.org/rss/1.0/modules/content/",
+    "dc": "http://purl.org/dc/elements/1.1/",
+}
+
+
+def _fetch_rss_root(feed_url: str):
+    """Download an RSS/Atom feed and return the parsed XML root element."""
+    import xml.etree.ElementTree as ET
+
+    request = urllib.request.Request(
+        feed_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (compatible; rss-reader/1.0)",
+            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read()
+    return ET.fromstring(raw)
+
+
+def _el_text(parent, *tags) -> str | None:
+    """Return stripped text of the first matching child tag (namespace-aware)."""
+    for tag in tags:
+        el = parent.find(tag, _RSS_NS)
+        if el is not None:
+            text = (el.text or "").strip()
+            if text:
+                return text
+    return None
+
+
+def _strip_html(text: str | None, limit: int = 500) -> str:
+    """Remove HTML tags/entities from feed descriptions and cap the length."""
+    if not text:
+        return ""
+    import html as _html
+
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _parse_itunes_duration(value: str | None) -> int | None:
+    """Convert itunes:duration ('3665', '61:05', or '1:01:05') to seconds."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return int(value)
+    parts = value.split(":")
+    try:
+        seconds = 0
+        for part in parts:
+            seconds = seconds * 60 + int(float(part))
+        return seconds
+    except ValueError:
+        return None
+
+
+@mcp.tool()
+def get_podcast_episodes(feed_url: str, max_episodes: int = 20) -> dict:
+    """
+    Traverse a podcast RSS feed and return each episode's direct audio URL.
+    This is the bridge between find_podcast_rss_feed and the transcription
+    tools: pass each returned audio_url to get_transcript_text or
+    start_podcast_transcription.
+    Returns podcast metadata plus a list of episodes, each with title,
+    audio_url (the enclosure .mp3/.m4a), pub_date, duration_seconds,
+    description, episode_link, and guid.
+    """
+    try:
+        root = _fetch_rss_root(feed_url)
+    except Exception as exc:
+        return {"feed_url": feed_url, "episodes": [], "error": f"Failed to fetch/parse feed: {exc}"[:400]}
+
+    channel = root.find("channel")
+    if channel is None:
+        return {
+            "feed_url": feed_url,
+            "episodes": [],
+            "error": "Feed has no <channel> element — not an RSS 2.0 podcast feed.",
+        }
+
+    episodes = []
+    for item in channel.findall("item"):
+        # The enclosure is the direct audio file; media:content is a fallback
+        # used by some hosts (e.g. Megaphone, Libsyn variants).
+        audio_url = audio_type = audio_length = None
+        enclosure = item.find("enclosure")
+        if enclosure is None:
+            enclosure = item.find("media:content", _RSS_NS)
+        if enclosure is not None:
+            audio_url = enclosure.get("url")
+            audio_type = enclosure.get("type")
+            audio_length = enclosure.get("length") or enclosure.get("fileSize")
+
+        if not audio_url:
+            continue  # not a playable episode (e.g. announcement-only item)
+
+        description = _el_text(item, "description", "itunes:summary", "content:encoded")
+        episodes.append({
+            "title": _el_text(item, "title"),
+            "audio_url": audio_url,
+            "audio_type": audio_type,
+            "audio_length_bytes": int(audio_length) if audio_length and str(audio_length).isdigit() else None,
+            "pub_date": _el_text(item, "pubDate", "dc:date"),
+            "duration_seconds": _parse_itunes_duration(_el_text(item, "itunes:duration")),
+            "description": _strip_html(description),
+            "episode_link": _el_text(item, "link"),
+            "guid": _el_text(item, "guid"),
+        })
+        if len(episodes) >= max_episodes:
+            break
+
+    return {
+        "feed_url": feed_url,
+        "podcast_title": _el_text(channel, "title"),
+        "podcast_author": _el_text(channel, "itunes:author", "managingEditor"),
+        "podcast_link": _el_text(channel, "link"),
+        "episode_count": len(episodes),
+        "episodes": episodes,
+        "next_step": (
+            "Pass an episode's audio_url AND its title to get_transcript_text or "
+            "start_podcast_transcription (title=..., uploader=podcast_title) so the "
+            "episode title stays attached to the URL in the transcript result."
+        ),
+    }
+
+
+@mcp.tool()
+def get_rss_feed_entries(feed_url: str, max_entries: int = 20) -> dict:
+    """
+    Traverse a news/article RSS or Atom feed (e.g. BBC News feeds) and return
+    its entries: title, article link, summary, publication date, and categories.
+    This is the bridge between an RSS feed URL and the article pages — fetch
+    the feed first with this tool, then read each returned 'link' to extract
+    the full article text.
+    Works with RSS 2.0 (BBC, most news sites) and Atom feeds.
+    """
+    try:
+        root = _fetch_rss_root(feed_url)
+    except Exception as exc:
+        return {"feed_url": feed_url, "entries": [], "error": f"Failed to fetch/parse feed: {exc}"[:400]}
+
+    entries = []
+    feed_title = feed_link = None
+
+    channel = root.find("channel")
+    if channel is not None:
+        # RSS 2.0 (BBC News feeds use this format)
+        feed_title = _el_text(channel, "title")
+        feed_link = _el_text(channel, "link")
+        for item in channel.findall("item"):
+            link = _el_text(item, "link", "guid")
+            if not link:
+                continue
+            entries.append({
+                "title": _el_text(item, "title"),
+                "link": link,
+                "summary": _strip_html(_el_text(item, "description", "content:encoded")),
+                "pub_date": _el_text(item, "pubDate", "dc:date"),
+                "categories": [
+                    (c.text or "").strip() for c in item.findall("category") if (c.text or "").strip()
+                ],
+                "guid": _el_text(item, "guid"),
+            })
+            if len(entries) >= max_entries:
+                break
+    elif root.tag.endswith("feed"):
+        # Atom feed
+        feed_title = _el_text(root, "atom:title")
+        for atom_link in root.findall("atom:link", _RSS_NS):
+            if atom_link.get("rel") in (None, "alternate"):
+                feed_link = atom_link.get("href")
+                break
+        for entry in root.findall("atom:entry", _RSS_NS):
+            link = None
+            for atom_link in entry.findall("atom:link", _RSS_NS):
+                if atom_link.get("rel") in (None, "alternate"):
+                    link = atom_link.get("href")
+                    break
+            if not link:
+                continue
+            entries.append({
+                "title": _el_text(entry, "atom:title"),
+                "link": link,
+                "summary": _strip_html(_el_text(entry, "atom:summary", "atom:content")),
+                "pub_date": _el_text(entry, "atom:published", "atom:updated"),
+                "categories": [
+                    c.get("term") for c in entry.findall("atom:category", _RSS_NS) if c.get("term")
+                ],
+                "guid": _el_text(entry, "atom:id"),
+            })
+            if len(entries) >= max_entries:
+                break
+    else:
+        return {
+            "feed_url": feed_url,
+            "entries": [],
+            "error": f"Unrecognized feed format (root element: {root.tag}). Expected RSS 2.0 or Atom.",
+        }
+
+    return {
+        "feed_url": feed_url,
+        "feed_title": feed_title,
+        "feed_link": feed_link,
+        "entry_count": len(entries),
+        "entries": entries,
+        "next_step": "Fetch each entry's 'link' to read the full article page.",
     }
 
 

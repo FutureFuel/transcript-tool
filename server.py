@@ -2120,6 +2120,203 @@ def find_podcast_rss_feed(name: str, max_results: int = 5) -> dict:
     }
 
 
+# ─────────────────────────────────────────────
+# DynamoDB: source table queries
+# ─────────────────────────────────────────────
+
+def _dynamodb_table(table_name: str = ""):
+    """Return a boto3 DynamoDB Table for *table_name* or the DYNAMODB_TABLE env var."""
+    import boto3
+
+    name = (table_name or os.environ.get("DYNAMODB_TABLE", "")).strip()
+    if not name:
+        raise RuntimeError(
+            "No table name given and DYNAMODB_TABLE environment variable is not set."
+        )
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    return boto3.resource("dynamodb", region_name=region).Table(name)
+
+
+def _dynamo_clean(obj):
+    """Convert boto3 DynamoDB values (Decimal, sets) into JSON-serializable types."""
+    from decimal import Decimal
+
+    if isinstance(obj, Decimal):
+        return int(obj) if obj == obj.to_integral_value() else float(obj)
+    if isinstance(obj, dict):
+        return {k: _dynamo_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_dynamo_clean(v) for v in obj]
+    if isinstance(obj, set):
+        return sorted(_dynamo_clean(v) for v in obj)
+    return obj
+
+
+@mcp.tool()
+def query_dynamodb(
+    key_name: str = "",
+    key_value: str = "",
+    index_name: str = "",
+    status: str = "",
+    table_name: str = "",
+    limit: int = 50,
+    next_token: str = "",
+) -> dict:
+    """
+    Query or scan the DynamoDB source table (or any table). Three modes:
+
+    1. Query the table directly by partition key:
+         query_dynamodb(key_name="source_id", key_value="abc123")
+    2. Query a GSI (Global Secondary Index):
+         query_dynamodb(index_name="status-index", key_name="status", key_value="pending")
+    3. Scan/list items by status (no index required — full table scan with filter):
+         query_dynamodb(status="pending")
+       Calling with no arguments scans and lists all items.
+
+    table_name overrides the DYNAMODB_TABLE environment variable.
+    Results are paginated: if the response includes next_token, pass it back
+    via the next_token parameter to fetch the next page.
+    Requires IAM permissions dynamodb:Query and dynamodb:Scan on the table
+    and its indexes (arn:...:table/NAME and arn:...:table/NAME/index/*).
+    """
+    import json as _json
+
+    from boto3.dynamodb.conditions import Attr, Key
+
+    try:
+        table = _dynamodb_table(table_name)
+    except Exception as exc:
+        return {"error": str(exc), "items": []}
+
+    kwargs: dict = {"Limit": max(1, min(limit, 500))}
+    if next_token:
+        try:
+            kwargs["ExclusiveStartKey"] = _json.loads(next_token)
+        except Exception:
+            return {"error": "next_token is not valid JSON — pass back the exact "
+                             "next_token value from the previous response.", "items": []}
+
+    try:
+        if key_name and key_value:
+            # Mode 1/2: key-condition query, optionally against a GSI.
+            kwargs["KeyConditionExpression"] = Key(key_name).eq(key_value)
+            if index_name:
+                kwargs["IndexName"] = index_name
+            if status and key_name != "status":
+                kwargs["FilterExpression"] = Attr("status").eq(status)
+            response = table.query(**kwargs)
+            operation = f"query ({'GSI ' + index_name if index_name else 'table'})"
+        else:
+            # Mode 3: scan, optionally filtered by status.
+            if index_name:
+                kwargs["IndexName"] = index_name
+            if status:
+                kwargs["FilterExpression"] = Attr("status").eq(status)
+            response = table.scan(**kwargs)
+            operation = f"scan{' (status=' + status + ')' if status else ''}"
+    except Exception as exc:
+        return {
+            "error": f"{type(exc).__name__}: {exc}",
+            "table": table.name,
+            "index_name": index_name or None,
+            "items": [],
+        }
+
+    items = [_dynamo_clean(item) for item in response.get("Items", [])]
+    last_key = response.get("LastEvaluatedKey")
+    return {
+        "table": table.name,
+        "operation": operation,
+        "index_name": index_name or None,
+        "count": len(items),
+        "scanned_count": response.get("ScannedCount"),
+        "items": items,
+        "next_token": _json.dumps(_dynamo_clean(last_key)) if last_key else None,
+    }
+
+
+@mcp.tool()
+def get_dynamodb_item(
+    key_name: str,
+    key_value: str,
+    table_name: str = "",
+    sort_key_name: str = "",
+    sort_key_value: str = "",
+) -> dict:
+    """
+    Fetch a single item from the DynamoDB source table (or any table) by its
+    primary key. Provide sort_key_name/sort_key_value if the table has a
+    composite key. table_name overrides the DYNAMODB_TABLE environment variable.
+    Requires IAM permission dynamodb:GetItem on the table.
+    """
+    try:
+        table = _dynamodb_table(table_name)
+    except Exception as exc:
+        return {"error": str(exc), "item": None}
+
+    key: dict = {key_name: key_value}
+    if sort_key_name:
+        key[sort_key_name] = sort_key_value
+
+    try:
+        response = table.get_item(Key=key)
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "table": table.name, "item": None}
+
+    item = response.get("Item")
+    return {
+        "table": table.name,
+        "key": key,
+        "found": item is not None,
+        "item": _dynamo_clean(item) if item else None,
+    }
+
+
+@mcp.tool()
+def describe_dynamodb_table(table_name: str = "") -> dict:
+    """
+    Describe the DynamoDB source table (or any table): key schema, GSIs and
+    their keys, item count, and status. Use this first to discover which
+    index/key names to pass to query_dynamodb.
+    table_name overrides the DYNAMODB_TABLE environment variable.
+    Requires IAM permission dynamodb:DescribeTable.
+    """
+    import boto3
+
+    name = (table_name or os.environ.get("DYNAMODB_TABLE", "")).strip()
+    if not name:
+        return {"error": "No table name given and DYNAMODB_TABLE is not set."}
+
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    try:
+        desc = boto3.client("dynamodb", region_name=region).describe_table(TableName=name)["Table"]
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}", "table": name}
+
+    def _keys(schema: list) -> dict:
+        return {k["KeyType"].lower(): k["AttributeName"] for k in schema}
+
+    return {
+        "table": name,
+        "status": desc.get("TableStatus"),
+        "item_count": desc.get("ItemCount"),
+        "size_bytes": desc.get("TableSizeBytes"),
+        "key_schema": _keys(desc.get("KeySchema", [])),
+        "attribute_types": {
+            a["AttributeName"]: a["AttributeType"]
+            for a in desc.get("AttributeDefinitions", [])
+        },
+        "global_secondary_indexes": [
+            {
+                "index_name": gsi["IndexName"],
+                "key_schema": _keys(gsi.get("KeySchema", [])),
+                "status": gsi.get("IndexStatus"),
+            }
+            for gsi in desc.get("GlobalSecondaryIndexes", [])
+        ],
+    }
+
+
 @mcp.tool()
 def check_server_config() -> dict:
     """
@@ -2179,6 +2376,7 @@ def check_server_config() -> dict:
         "aws": {
             "S3_BUCKET": os.environ.get("S3_BUCKET", "(not set)"),
             "AWS_REGION": os.environ.get("AWS_REGION", "us-east-1"),
+            "DYNAMODB_TABLE": os.environ.get("DYNAMODB_TABLE", "(not set)"),
         },
     }
 
